@@ -10,9 +10,9 @@ let package = Package(
         .library(name: "HopBearerRelay", targets: ["HopBearerRelay"]),
     ],
     dependencies: [
-        .package(path: "../../../sdk/wrappers/swift"),
+        .package(path: "../../../sdk/wrappers/Hop"),
     ],
     targets: [
-        .target(name: "HopBearerRelay", dependencies: [.product(name: "Hop", package: "swift")]),
+        .target(name: "HopBearerRelay", dependencies: [.product(name: "Hop", package: "Hop")]),
     ]
 )

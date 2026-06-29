@@ -11,10 +11,10 @@ let package = Package(
         .library(name: "HopBearerLan", targets: ["HopBearerLan"]),
     ],
     dependencies: [
-        .package(path: "../../../sdk/wrappers/swift"),
+        .package(path: "../../../sdk/wrappers/Hop"),
     ],
     targets: [
-        // package id is the dir name of the SDK path dependency ("swift"); the product is "Hop".
-        .target(name: "HopBearerLan", dependencies: [.product(name: "Hop", package: "swift")]),
+        // the SDK package (dir "Hop") provides the "Hop" product.
+        .target(name: "HopBearerLan", dependencies: [.product(name: "Hop", package: "Hop")]),
     ]
 )

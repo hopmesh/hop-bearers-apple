@@ -11,9 +11,9 @@ let package = Package(
         .library(name: "HopBearerBle", targets: ["HopBearerBle"]),
     ],
     dependencies: [
-        .package(path: "../../../sdk/wrappers/swift"),
+        .package(path: "../../../sdk/wrappers/Hop"),
     ],
     targets: [
-        .target(name: "HopBearerBle", dependencies: [.product(name: "Hop", package: "swift")]),
+        .target(name: "HopBearerBle", dependencies: [.product(name: "Hop", package: "Hop")]),
     ]
 )
