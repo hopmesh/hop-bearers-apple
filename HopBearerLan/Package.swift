@@ -15,6 +15,6 @@ let package = Package(
     ],
     targets: [
         // the SDK package (dir "Hop") provides the "Hop" product.
-        .target(name: "HopBearerLan", dependencies: [.product(name: "Hop", package: "Hop")]),
+        .target(name: "HopBearerLan", dependencies: [.product(name: "HopContract", package: "Hop")]),
     ]
 )

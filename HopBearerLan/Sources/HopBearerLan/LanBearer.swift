@@ -16,7 +16,7 @@
 
 import Foundation
 import Network
-import Hop   // the bearer contract (Bearer/LinkSink) + transport utils now live in the Hop SDK
+import HopContract   // the bearer contract (no libhop)
 
 let LAN_SERVICE_TYPE = "_hoplan._tcp"
 

@@ -17,7 +17,7 @@
 
 import Foundation
 import CryptoKit
-import Hop   // contract + utils from the Hop SDK
+import HopContract   // the bearer contract (no libhop)
 
 private let RELAY_BACKOFF_MIN_S: Double = 1.0
 private let RELAY_BACKOFF_MAX_S: Double = 30.0

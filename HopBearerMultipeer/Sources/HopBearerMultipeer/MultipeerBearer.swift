@@ -13,7 +13,7 @@
 
 import Foundation
 import MultipeerConnectivity
-import Hop   // contract + utils from the Hop SDK
+import HopContract   // the bearer contract (no libhop)
 
 /// MultipeerConnectivity service type (Bonjour-style; ≤15 chars, [a-z0-9-]). Must match across peers.
 let MP_SERVICE_TYPE = "hop-wifi"

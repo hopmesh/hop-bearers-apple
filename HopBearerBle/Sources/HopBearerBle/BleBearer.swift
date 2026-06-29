@@ -18,7 +18,7 @@
 import Foundation
 import CoreBluetooth
 import Security
-import Hop   // contract + utils from the Hop SDK
+import HopContract   // the bearer contract (no libhop)
 
 // MARK: - Fresh service scheme (SPEC §1.1) -------------------------------------------------------
 
