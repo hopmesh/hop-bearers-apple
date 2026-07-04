@@ -13,14 +13,18 @@
 // iOS-only: CLBeaconRegion monitoring is unavailable on macOS, so the CLI/hopmac builds skip this
 // file entirely (the bearer's #if os(iOS) guards leave `wake()` reachable via the AppDelegate path).
 
-#if os(iOS)
 import Foundation
-import CoreLocation
 
-/// The iBeacon UUID THIS app monitors for background wake. It MUST byte-match the value a nearby
-/// Android emits (ble-lab `:bearer-ble` BEACON_UUID) — if they differ, iOS never sees the beacon and
-/// a force-quit app never wakes. (Historic silent bug: a stale F0900BEA… here vs 7ED7BEAC… on Android.)
+/// The iBeacon UUID THIS app monitors for background wake, and the SINGLE SOURCE OF TRUTH for the
+/// value across the shared bearer, the app drivers, and the Android emitter (F-40). It MUST byte-match
+/// what Android emits (bearer-ble BEACON_UUID) — a mismatch means iOS never sees the beacon and a
+/// force-quit app never wakes (the historic F0900BEA-vs-7ED7BEAC silent bug). Kept OUTSIDE the
+/// `#if os(iOS)` guard (it's a plain UUID, platform-neutral) so macOS builds — e.g. the hopmac test
+/// tool — can reference it too instead of redefining the literal.
 public let BEACON_UUID = UUID(uuidString: "7ED7BEAC-3C2A-4F19-9B8E-1A2B3C4D5E6F")!
+
+#if os(iOS)
+import CoreLocation
 
 /// Region monitor that wakes the BLE bearer. On a region enter / inside-state it invokes `onWake`.
 final class BeaconWake: NSObject, CLLocationManagerDelegate {

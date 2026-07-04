@@ -23,6 +23,8 @@ let LAN_SERVICE_TYPE = "_hoplan._tcp"
 private let LAN_PING_S: Double = 1.0
 private let LAN_DEAD_S: Double = 15.0     // TCP is reliable; a generous liveness deadline
 private let LAN_REAP_S: Double = 5.0      // close a connection that never completes HELLO
+private let LAN_CONNECT_S: Double = 8.0   // F-11: give up a dial that never reaches .ready
+private let LAN_RESTART_S: Double = 2.0   // F-11: backoff before restarting a failed listener/browser
 private let LAN_MAX_FRAME = 4 * 1024 * 1024
 
 private let L_HELLO: UInt8 = 0x01
@@ -49,6 +51,7 @@ final class LanLink {
     private var rxSeq: UInt64 = 0
     private var ping: DispatchSourceTimer?
     private var watchdog: DispatchSourceTimer?
+    private var connectDeadline: DispatchSourceTimer?   // F-11: armed at start(), fires if never .ready
     private var closed = false
     // Own ourselves from start() until close(): nothing else holds a strong ref until onUp inserts us
     // into the bearer's maps, and the NWConnection handlers capture us weakly — so without this the
@@ -73,16 +76,29 @@ final class LanLink {
             guard let self else { return }
             switch state {
             case .ready:       self.onReady()
+            case .waiting(let e): log("STATE", "lan waiting \(e)")  // deadline (below) cancels a wedged dial
             case .failed(let e): self.close("nwconn failed \(e)")
             case .cancelled:   self.close("nwconn cancelled")
             default: break
             }
         }
         selfRetain = self          // own our lifecycle until close() (see selfRetain decl)
+        // F-11: arm the connect deadline from start(), NOT onReady(). A dial stuck in .waiting
+        // (ECONNREFUSED / unreachable / a stale Bonjour record for a restarted peer) never reaches
+        // .ready, so the onReady-armed reaper never runs — the link would self-retain forever and
+        // pin the peer in the bearer's `dialing` set, permanently blacklisting it for the process.
+        let d = DispatchSource.makeTimerSource(queue: queue)
+        d.schedule(deadline: .now() + LAN_CONNECT_S)
+        d.setEventHandler { [weak self] in
+            guard let self, !self.up else { return }
+            self.close("connect timeout")
+        }
+        connectDeadline = d; d.resume()
         conn.start(queue: queue)
     }
 
     private func onReady() {
+        connectDeadline?.cancel(); connectDeadline = nil   // reached .ready; the liveness watchdog takes over
         log("STATE", "lan channel-ready isDialer=\(isDialer)")
         // HELLO first: [0x01][16B nodeId][1B role][1B flags]
         var hello = Data([L_HELLO]); hello.append(myId); hello.append(isDialer ? 1 : 0); hello.append(0)
@@ -170,7 +186,7 @@ final class LanLink {
     func close(_ why: String) {
         guard !closed else { return }
         closed = true
-        ping?.cancel(); watchdog?.cancel()
+        ping?.cancel(); watchdog?.cancel(); connectDeadline?.cancel()
         conn.cancel()
         log("STATE", "lan link-down (\(why)) peer=\(peerShort) isDialer=\(isDialer)")
         onClose(self)
@@ -196,20 +212,54 @@ public final class LanBearer: Bearer {
     private var linksByLinkId = [LinkId: LanLink]()
     private var dialing = Set<String>()         // peerId-hex currently being dialed (pre-HELLO dedup)
     private var nextLinkId: LinkId = 1
+    private var stopped = false                 // F-11: gate restart-after-failure once stopped
+    private var listenerRestartPending = false
+    private var browserRestartPending = false
 
     public init(myId: Data) { self.myId = myId }
 
     public func start() {
         log("STATE", "lan node-start myId=\(hex(myId)) service=\(LAN_SERVICE_TYPE)")
-        lanQueue.async { [weak self] in self?.startListener(); self?.startBrowser() }
+        lanQueue.async { [weak self] in
+            guard let self else { return }
+            self.stopped = false
+            self.startListener()
+            self.startBrowser()
+        }
     }
 
     public func stop() {
         lanQueue.async { [weak self] in
             guard let self else { return }
+            self.stopped = true
             self.listener?.cancel(); self.listener = nil
             self.browser?.cancel(); self.browser = nil
             for l in self.linksByPeerId.values { l.close("stop") }
+        }
+    }
+
+    // F-11: a failed listener/browser used to only log — after a Wi-Fi transition or sleep/wake the
+    // device would silently stop accepting/discovering on LAN until the app relaunched. Rebuild each
+    // on failure with a short backoff (unless we've been stopped).
+    private func restartListener() {
+        guard !stopped, !listenerRestartPending else { return }
+        listenerRestartPending = true
+        listener?.cancel(); listener = nil
+        lanQueue.asyncAfter(deadline: .now() + LAN_RESTART_S) { [weak self] in
+            guard let self else { return }
+            self.listenerRestartPending = false
+            if !self.stopped { self.startListener() }
+        }
+    }
+
+    private func restartBrowser() {
+        guard !stopped, !browserRestartPending else { return }
+        browserRestartPending = true
+        browser?.cancel(); browser = nil
+        lanQueue.asyncAfter(deadline: .now() + LAN_RESTART_S) { [weak self] in
+            guard let self else { return }
+            self.browserRestartPending = false
+            if !self.stopped { self.startBrowser() }
         }
     }
 
@@ -233,7 +283,12 @@ public final class LanBearer: Bearer {
                                    onClose: { [weak self] in self?.onClose($0) })
                 link.start()
             }
-            l.stateUpdateHandler = { state in if case .failed(let e) = state { log("STATE", "lan listener failed \(e)") } }
+            l.stateUpdateHandler = { [weak self] state in
+                if case .failed(let e) = state {
+                    log("STATE", "lan listener failed \(e) — restarting")
+                    self?.restartListener()
+                }
+            }
             l.start(queue: lanQueue)
             listener = l
             log("STATE", "lan listening name=\(shortHex(myId))")
@@ -255,7 +310,12 @@ public final class LanBearer: Bearer {
                 self.dial(r.endpoint, peerId)
             }
         }
-        b.stateUpdateHandler = { state in if case .failed(let e) = state { log("STATE", "lan browser failed \(e)") } }
+        b.stateUpdateHandler = { [weak self] state in
+            if case .failed(let e) = state {
+                log("STATE", "lan browser failed \(e) — restarting")
+                self?.restartBrowser()
+            }
+        }
         b.start(queue: lanQueue)
         browser = b
     }
@@ -265,8 +325,39 @@ public final class LanBearer: Bearer {
         let link = LanLink(conn: conn, linkId: mint(), isDialer: true, myId: myId, queue: lanQueue,
                            onUp: { [weak self] in self?.onUp($0) },
                            onData: { [weak self] in self?.onData($0, $1) },
-                           onClose: { [weak self] l in self?.dialing.remove(hex(peerId)); self?.onClose(l) })
+                           onClose: { [weak self] l in self?.onDialClosed(l, peerId) })
         link.start()
+    }
+
+    // F-14: a dial that closes before ever coming up (connect timeout / refused) used to just drop
+    // the peer from `dialing` and wait for mDNS to re-announce — which may not happen for a long time,
+    // silently forfeiting the high-bandwidth LAN path (with Wi-Fi Direct gone, LAN is the only Wi-Fi
+    // transport for Android↔Android). Re-scan the current browse results shortly after so a transient
+    // failure retries instead of stranding the peer. The greater-id tiebreaker means only we will dial.
+    private func onDialClosed(_ link: LanLink, _ peerId: Data) {
+        dialing.remove(hex(peerId))
+        let neverCameUp = link.peerId == nil || linksByPeerId[peerId] == nil
+        onClose(link)
+        if !stopped, neverCameUp, linksByPeerId[peerId] == nil {
+            lanQueue.asyncAfter(deadline: .now() + LAN_RESTART_S) { [weak self] in
+                self?.rescanForDials()
+            }
+        }
+    }
+
+    /// Re-walk the browser's current results and dial any known-but-unlinked peer we should dial.
+    /// The BLE central re-dials on every advert sighting; LAN lacks that pressure, so we add it here.
+    private func rescanForDials() {
+        guard !stopped, let results = browser?.browseResults else { return }
+        for r in results {
+            guard case let .service(name, _, _, _) = r.endpoint else { continue }
+            guard let peerId = peerIdFromName(name) else { continue }
+            if peerId == myId || linksByPeerId[peerId] != nil { continue }
+            if !nodeIdGreater(myId, peerId) { continue }
+            if !dialing.insert(hex(peerId)).inserted { continue }
+            log("STATE", "lan rescan re-dial peer=\(shortHex(peerId))")
+            dial(r.endpoint, peerId)
+        }
     }
 
     // MARK: link lifecycle (all on lanQueue)

@@ -19,6 +19,9 @@ import Foundation
 import CoreBluetooth
 import Security
 import HopContract   // the bearer contract (no libhop)
+#if os(iOS)
+import CoreLocation   // CLBeaconRegion — the iBeacon EMISSION payload (iOS-only)
+#endif
 
 // MARK: - Fresh service scheme (SPEC §1.1) -------------------------------------------------------
 
@@ -279,32 +282,84 @@ final class Link: NSObject, StreamDelegate {
 // MARK: - ACCEPTOR (peripheral): listener (session-stable PSM) + GATT char + advertiser ----------
 // SPEC §3.1.
 
+/// F-12: how often the peripheral re-checks that it is still discoverable (L2CAP published +
+/// advertising) and re-arms if not. ble-lab SPEC §7.1 requires this periodic self-heal; without it a
+/// publish/advertise error, a stopped advertising set, or a system hiccup leaves the device silently
+/// undiscoverable-as-peripheral until the app restarts.
+private let PERIPHERAL_HEAL_S: Double = 30.0
+
 final class Peripheral: NSObject, CBPeripheralManagerDelegate {
     private var pm: CBPeripheralManager!
     private var psm: CBL2CAPPSM = 0
     private var published = false
+    private var healScheduled = false
+    private var stopped = false
     private let myId: Data
     private let mintLinkId: () -> LinkId
     private let onLink: (Link) -> Void
     private let onData: (Link, Data) -> Void
     private let onClose: (Link) -> Void
     private let onPowerOff: () -> Void
+    /// When true, never advertise: still publish the GATT service + L2CAP channel (so a link CAN be
+    /// accepted if a peer somehow reaches us) but stay undiscoverable. Used by the central-only host
+    /// (hopmac): it scans and dials, but must not itself be found (scan-only test behavior).
+    private let suppressAdvertising: Bool
+    #if os(iOS)
+    /// iBeacon EMISSION (iOS-only). On iOS the service-UUID advert and an iBeacon advert are mutually
+    /// exclusive, so we ALTERNATE: ~5s service-UUID (for L2CAP discovery), ~2s iBeacon (to wake nearby
+    /// dormant/force-quit apps whose BeaconWake monitors this region). Mirrors the old app's advert cycle.
+    private var advTimer: DispatchSourceTimer?
+    private var advCounter = 0
+    private var advBeaconNow = false
+    #endif
 
-    init(myId: Data, mintLinkId: @escaping () -> LinkId,
+    init(myId: Data, suppressAdvertising: Bool, mintLinkId: @escaping () -> LinkId,
          onLink: @escaping (Link) -> Void, onData: @escaping (Link, Data) -> Void,
          onClose: @escaping (Link) -> Void, onPowerOff: @escaping () -> Void) {
-        self.myId = myId; self.mintLinkId = mintLinkId
+        self.myId = myId; self.suppressAdvertising = suppressAdvertising; self.mintLinkId = mintLinkId
         self.onLink = onLink; self.onData = onData; self.onClose = onClose; self.onPowerOff = onPowerOff
         super.init()
         pm = CBPeripheralManager(delegate: self, queue: bleQueue,
                                  options: [CBPeripheralManagerOptionRestoreIdentifierKey: RESTORE_ID_PERIPHERAL])
+        scheduleSelfHeal()   // F-12: keep the advertiser/L2CAP re-armed
     }
 
     func stop() {
+        stopped = true
         guard let pm = pm else { return }
+        #if os(iOS)
+        advTimer?.cancel(); advTimer = nil
+        #endif
         pm.stopAdvertising()
         if published { pm.unpublishL2CAPChannel(psm); published = false }
         pm.removeAllServices()
+    }
+
+    // F-12: periodic self-heal (ble-lab SPEC §7.1). If we're powered on but not published, republish
+    // the L2CAP channel (which re-triggers advertising on success); if published but not advertising,
+    // restart advertising. This is what recovers a wedged/stopped advertiser or a failed publish —
+    // the delegate error handlers just log, this loop is what actually retries.
+    private func scheduleSelfHeal() {
+        guard !healScheduled else { return }
+        healScheduled = true
+        bleQueue.asyncAfter(deadline: .now() + PERIPHERAL_HEAL_S) { [weak self] in
+            guard let self else { return }
+            self.healScheduled = false
+            self.selfHeal()
+            if !self.stopped { self.scheduleSelfHeal() }
+        }
+    }
+
+    private func selfHeal() {
+        guard !stopped, let pm = pm, pm.state == .poweredOn else { return }
+        if ProcessInfo.processInfo.environment["HOPLAB_NO_ADV"] != nil { return }  // central-only diagnostic
+        if !published {
+            log("STATE", "peripheral self-heal: republishing L2CAP")
+            pm.publishL2CAPChannel(withEncryption: false)
+        } else if !pm.isAdvertising {
+            log("STATE", "peripheral self-heal: restarting advertising")
+            pm.startAdvertising([CBAdvertisementDataServiceUUIDsKey: [SERVICE_UUID]])
+        }
     }
 
     func peripheralManagerDidUpdateState(_ p: CBPeripheralManager) {
@@ -320,20 +375,71 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ p: CBPeripheralManager, didPublishL2CAPChannel PSM: CBL2CAPPSM, error: Error?) {
-        if let error { log("STATE", "peripheral l2cap-publish-FAILED \(error.localizedDescription)"); return }
+        if let error {
+            // `published` stays false, so the F-12 self-heal loop retries publish shortly.
+            log("STATE", "peripheral l2cap-publish-FAILED \(error.localizedDescription) — self-heal will retry")
+            return
+        }
         psm = PSM
         published = true
         log("STATE", "peripheral l2cap-published psm=\(psm)")
-        if ProcessInfo.processInfo.environment["HOPLAB_NO_ADV"] != nil {        // DIAG: central-only (suppress advertising)
-            log("STATE", "peripheral advertising-SUPPRESSED (HOPLAB_NO_ADV) — central-only diagnostic")
+        // Central-only host (hopmac) OR the legacy DIAG env var: publish everything but stay
+        // undiscoverable (no advertising at all).
+        if suppressAdvertising || ProcessInfo.processInfo.environment["HOPLAB_NO_ADV"] != nil {
+            log("STATE", "peripheral advertising-SUPPRESSED (central-only) — publish-only, no advertising")
             return
         }
+        #if os(iOS)
+        // iOS: alternate service-UUID advert (L2CAP discovery) with an iBeacon advert (background wake).
+        startAdvertisingCycle(p)
+        #else
         p.startAdvertising([CBAdvertisementDataServiceUUIDsKey: [SERVICE_UUID]])  // UUID only on Apple (SPEC §1.3)
         log("STATE", "peripheral advertising-started service=\(SERVICE_UUID.uuidString)")
+        #endif
     }
 
+    #if os(iOS)
+    /// Advertise on a ~7s cycle: ~5s service-UUID (peers discover us + read the PSM to open L2CAP),
+    /// ~2s iBeacon (nearby dormant/force-quit apps monitoring BEACON_UUID get woken). The two advert
+    /// forms are mutually exclusive on iOS, so we swap between them instead of running both at once.
+    private func startAdvertisingCycle(_ p: CBPeripheralManager) {
+        applyAdvertising(p, beacon: false)
+        let t = DispatchSource.makeTimerSource(queue: bleQueue)
+        t.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        t.setEventHandler { [weak self, weak p] in
+            guard let self, let p else { return }
+            self.advCounter = (self.advCounter + 1) % 7
+            let wantBeacon = self.advCounter >= 5   // ~2s beacon out of every 7s
+            if wantBeacon != self.advBeaconNow {
+                self.advBeaconNow = wantBeacon
+                self.applyAdvertising(p, beacon: wantBeacon)
+            }
+        }
+        advTimer?.cancel()
+        advTimer = t
+        t.resume()
+    }
+
+    /// Emit either the service-UUID advert (so peers can discover + read the PSM) or the iBeacon advert
+    /// (wake). The iBeacon payload is built the way the old app did: `CLBeaconRegion(uuid: BEACON_UUID,
+    /// identifier: "hop").peripheralData(withMeasuredPower: nil)`, byte-matching what Android emits.
+    private func applyAdvertising(_ p: CBPeripheralManager, beacon: Bool) {
+        guard p.state == .poweredOn else { return }
+        p.stopAdvertising()
+        if beacon {
+            let region = CLBeaconRegion(uuid: BEACON_UUID, identifier: "hop")
+            if let data = region.peripheralData(withMeasuredPower: nil) as? [String: Any] {
+                p.startAdvertising(data)
+                return
+            }
+        }
+        p.startAdvertising([CBAdvertisementDataServiceUUIDsKey: [SERVICE_UUID]])  // UUID only on Apple (SPEC §1.3)
+    }
+    #endif
+
     func peripheralManagerDidStartAdvertising(_ p: CBPeripheralManager, error: Error?) {
-        if let error { log("STATE", "peripheral advertising-FAILED \(error.localizedDescription)") }
+        // On failure `isAdvertising` stays false, so the F-12 self-heal loop restarts advertising.
+        if let error { log("STATE", "peripheral advertising-FAILED \(error.localizedDescription) — self-heal will retry") }
     }
 
     func peripheralManager(_ p: CBPeripheralManager, didReceiveRead req: CBATTRequest) {
@@ -360,8 +466,13 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ p: CBPeripheralManager, willRestoreState dict: [String: Any]) {
-        // SPEC R10: re-add the GATT service BEFORE re-advertising, then re-publish L2CAP if needed.
-        log("STATE", "peripheral willRestoreState")
+        // SPEC R10: after a system-initiated relaunch, CoreBluetooth restores our services and the
+        // published L2CAP channel, then calls peripheralManagerDidUpdateState(.poweredOn) which
+        // re-adds the service + republishes; the F-12 self-heal loop then guarantees advertising is
+        // (re)started even if that path hiccups. Reset `published` so the heal loop re-publishes if
+        // the restored channel isn't actually live.
+        log("STATE", "peripheral willRestoreState — re-arm on poweredOn + self-heal")
+        published = false
     }
 }
 
@@ -609,8 +720,14 @@ public final class BleBearer: Bearer {
     private var beaconWake: BeaconWake?              // the bearer's own iBeacon background-wake monitor
     #endif
 
-    public init(myId: Data) {
+    /// When true, the bearer publishes its GATT/L2CAP endpoint but NEVER advertises, so it can dial
+    /// peers (central) yet stay undiscoverable (central-only scan behavior — hopmac). Default false:
+    /// the dual-role production bearer advertises so peers can find it.
+    private let suppressAdvertising: Bool
+
+    public init(myId: Data, suppressAdvertising: Bool = false) {
         self.myId = myId
+        self.suppressAdvertising = suppressAdvertising
     }
 
     /// Convenience: a fresh random 16-byte nodeId (SPEC R11) for callers that don't supply one.
@@ -625,7 +742,7 @@ public final class BleBearer: Bearer {
 
     public func start() {
         log("STATE", "node-start myId=\(hex(myId)) (greater-nodeId dials)")
-        peripheral = Peripheral(myId: myId,
+        peripheral = Peripheral(myId: myId, suppressAdvertising: suppressAdvertising,
             mintLinkId: { [weak self] in self?.mint() ?? 0 },
             onLink:     { [weak self] in self?.onUp($0) },
             onData:     { [weak self] in self?.onData($0, $1) },

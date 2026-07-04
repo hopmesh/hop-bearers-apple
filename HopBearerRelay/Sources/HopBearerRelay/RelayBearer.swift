@@ -21,6 +21,7 @@ import HopContract   // the bearer contract (no libhop)
 
 private let RELAY_BACKOFF_MIN_S: Double = 1.0
 private let RELAY_BACKOFF_MAX_S: Double = 30.0
+private let RELAY_STABLE_S: Double = 20.0   // F-13: only reset backoff after the link holds this long
 
 public final class RelayBearer: NSObject, Bearer {
     public weak var sink: LinkSink?
@@ -45,6 +46,8 @@ public final class RelayBearer: NSObject, Bearer {
     private var up = false
     private var reconnectScheduled = false
     private var backoff = RELAY_BACKOFF_MIN_S
+    private var stableWork: DispatchWorkItem?      // F-13: fires after RELAY_STABLE_S to reset backoff
+    private var retryAfter: Double?                // F-13: server-driven backoff from a 429 Retry-After
 
     public init(relayURL: String) {
         self.relayURL = relayURL
@@ -114,6 +117,7 @@ public final class RelayBearer: NSObject, Bearer {
 
     /// Tear the current socket down (idempotent), surface linkDown once, then schedule a reconnect.
     private func handleDown() {
+        stableWork?.cancel(); stableWork = nil       // F-13: the link didn't stay stable
         if up { up = false; sink?.linkDown(linkId) }
         task = nil
         session?.invalidateAndCancel(); session = nil
@@ -123,8 +127,17 @@ public final class RelayBearer: NSObject, Bearer {
     private func scheduleReconnect() {
         guard started, !reconnectScheduled else { return }
         reconnectScheduled = true
-        let delay = backoff + Double.random(in: 0...1)   // backoff + jitter
-        backoff = min(backoff * 2, RELAY_BACKOFF_MAX_S)
+        // F-13: honor a server-driven Retry-After (429) when present; otherwise exponential backoff.
+        // Jitter always, so a fleet whose sockets all drop at once (e.g. a relay redeploy) doesn't
+        // reconnect in lockstep.
+        let delay: Double
+        if let ra = retryAfter {
+            retryAfter = nil
+            delay = ra + Double.random(in: 0...1)
+        } else {
+            delay = backoff + Double.random(in: 0...1)
+            backoff = min(backoff * 2, RELAY_BACKOFF_MAX_S)
+        }
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.reconnectScheduled = false
@@ -141,10 +154,18 @@ extension RelayBearer: URLSessionWebSocketDelegate {
         queue.async { [weak self] in
             guard let self, webSocketTask === self.task else { return }
             self.up = true
-            self.backoff = RELAY_BACKOFF_MIN_S
             log("STATE", "relay link-up peer=\(shortHex(self.peerId))")
             self.sink?.linkUp(self.linkId, role: .dialer, peerId: self.peerId)   // dialer = Noise initiator
             self.receiveLoop()
+            // F-13: reset backoff only after the link has been stable for a while, not on open — a
+            // relay that accepts then immediately drops (overloaded / scale-capped) would otherwise be
+            // re-dialed at the 1s floor forever.
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.up else { return }
+                self.backoff = RELAY_BACKOFF_MIN_S
+            }
+            self.stableWork = work
+            self.queue.asyncAfter(deadline: .now() + RELAY_STABLE_S, execute: work)
         }
     }
 
@@ -157,8 +178,22 @@ extension RelayBearer: URLSessionWebSocketDelegate {
     }
 
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // F-13: if the WS upgrade was rejected with 429, honor the server's Retry-After instead of
+        // hammering it on the normal backoff schedule. Read the response off the task before hopping
+        // queues (it's the HTTP upgrade response for a failed handshake).
+        let retry: Double?
+        if let http = task.response as? HTTPURLResponse, http.statusCode == 429 {
+            if let ra = http.value(forHTTPHeaderField: "Retry-After"), let secs = Double(ra) {
+                retry = secs
+            } else {
+                retry = RELAY_BACKOFF_MAX_S
+            }
+        } else {
+            retry = nil
+        }
         queue.async { [weak self] in
             guard let self, task === self.task else { return }
+            if let retry { self.retryAfter = retry; log("STATE", "relay 429 rate-limited; backing off \(retry)s") }
             self.handleDown()
         }
     }
