@@ -15,5 +15,6 @@ let package = Package(
     ],
     targets: [
         .target(name: "HopBearerBle", dependencies: [.product(name: "HopContract", package: "Hop")]),
+        .testTarget(name: "HopBearerBleTests", dependencies: ["HopBearerBle"]),
     ]
 )

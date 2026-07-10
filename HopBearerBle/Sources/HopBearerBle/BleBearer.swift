@@ -79,6 +79,10 @@ final class Link: NSObject, StreamDelegate {
     let myId: Data
     private(set) var peerId: Data?                  // learned from HELLO; the dedup/tiebreak key
     private(set) var up = false
+    // apple-12: set true by the bearer iff this exact leg was announced to the sink via linkUp. A
+    // deduped loser is closed without ever being surfaced, so its onClose must NOT emit a linkDown.
+    // Touched only from bearer code under BleBearer.mapLock, so no additional synchronization here.
+    var wasSurfaced = false
 
     // CRITICAL: retain the CBL2CAPChannel for the link's whole life. inputStream/outputStream are
     // just views onto the channel's socket fd; if the channel deallocs, that fd is closed and the
@@ -530,17 +534,22 @@ final class Central: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     /// system still considers connected for our service, so the link can complete via
     /// state restoration even if the ~10 s scan window closes first.
     func wake(_ reason: String) {
-        guard let cm = cm else { return }
-        log("STATE", "WAKE(\(reason)) state=\(stateName(cm.state)) scanning=\(cm.isScanning)")
-        guard cm.state == .poweredOn else { return }   // scan auto-starts on .poweredOn
-        if !cm.isScanning {
-            cm.scanForPeripherals(withServices: [SERVICE_UUID],
-                                  options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
-            log("STATE", "WAKE re-armed scan")
-        }
-        for p in cm.retrieveConnectedPeripherals(withServices: [SERVICE_UUID]) where retained[p.identifier] == nil {
-            log("STATE", "WAKE re-adopt connected id=\(p.identifier.uuidString.prefix(8))")
-            dial(cm, p, advPrefixById[p.identifier])
+        // wake() is called from the AppDelegate / BeaconWake on the MAIN thread, but it reads and mutates
+        // `retained`/`advPrefixById`/scan state that every other Central path touches on bleQueue (the CB
+        // delegate queue). Hop onto bleQueue so all Central state stays single-homed (apple-01).
+        bleQueue.async { [weak self] in
+            guard let self, let cm = self.cm else { return }
+            log("STATE", "WAKE(\(reason)) state=\(stateName(cm.state)) scanning=\(cm.isScanning)")
+            guard cm.state == .poweredOn else { return }   // scan auto-starts on .poweredOn
+            if !cm.isScanning {
+                cm.scanForPeripherals(withServices: [SERVICE_UUID],
+                                      options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+                log("STATE", "WAKE re-armed scan")
+            }
+            for p in cm.retrieveConnectedPeripherals(withServices: [SERVICE_UUID]) where self.retained[p.identifier] == nil {
+                log("STATE", "WAKE re-adopt connected id=\(p.identifier.uuidString.prefix(8))")
+                self.dial(cm, p, self.advPrefixById[p.identifier])
+            }
         }
     }
 
@@ -712,9 +721,16 @@ public final class BleBearer: Bearer {
     public let transportName = "BT"
     private var peripheral: Peripheral?
     private var central: Central?
+    // The link maps + linkId counter are the ONE piece of BleBearer state touched from more than one
+    // executor: onUp/onData/onClose/send/closeAllLinks run on bleRunLoop (the stream/timer I/O thread),
+    // while the Central's haveLinkTo/haveLinkToPrefix dial gates read them on bleQueue (the CB delegate
+    // queue). Swift Dictionary reads concurrent with mutation are undefined behavior, so every access to
+    // these three fields goes through `mapLock`. Held only for the map touch itself: never call out to a
+    // Link (close/send) or the sink while holding it, to avoid re-entrancy/lock-ordering hazards.
+    private let mapLock = NSLock()
     private var linksByPeerId = [Data: Link]()       // dedup: one survivor per peer (SPEC §2.3)
     private var linksByLinkId = [LinkId: Link]()     // send routing + linkUp/linkDown pairing
-    private var nextLinkId: LinkId = 1               // minted on bleRunLoop (single-threaded) — no lock
+    private var nextLinkId: LinkId = 1               // minted under mapLock
     private var status: Timer?
     #if os(iOS)
     private var beaconWake: BeaconWake?              // the bearer's own iBeacon background-wake monitor
@@ -754,8 +770,8 @@ public final class BleBearer: Bearer {
             onData:     { [weak self] in self?.onData($0, $1) },
             onClose:    { [weak self] in self?.onClose($0) },
             onPowerOff: { [weak self] in self?.closeAllLinks() },
-            haveLinkTo:       { [weak self] in self?.linksByPeerId[$0] != nil },
-            haveLinkToPrefix: { [weak self] pre in self?.linksByPeerId.keys.contains { $0.prefix(6) == pre } ?? false })
+            haveLinkTo:       { [weak self] in self?.haveLinkTo($0) ?? false },
+            haveLinkToPrefix: { [weak self] pre in self?.haveLinkToPrefix(pre) ?? false })
 
         let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.printStatus() }
         bleRunLoop.add(t, forMode: .common)
@@ -783,41 +799,70 @@ public final class BleBearer: Bearer {
 
     public func send(_ bytes: Data, on link: LinkId) {
         bleRunLoop.perform { [weak self] in
-            guard let self, let l = self.linksByLinkId[link] else { return }    // no-op if link closed/unknown
-            l.sendData(bytes)
+            guard let self else { return }
+            mapLock.lock(); let l = linksByLinkId[link]; mapLock.unlock()        // no-op if link closed/unknown
+            l?.sendData(bytes)
         }
     }
 
-    private func mint() -> LinkId { let id = nextLinkId; nextLinkId += 1; return id }
+    private func mint() -> LinkId {
+        mapLock.lock(); defer { mapLock.unlock() }
+        let id = nextLinkId; nextLinkId += 1; return id
+    }
+
+    /// dial gate (Central, on bleQueue): read the peer map under the lock.
+    private func haveLinkTo(_ peer: Data) -> Bool {
+        mapLock.lock(); defer { mapLock.unlock() }
+        return linksByPeerId[peer] != nil
+    }
+    private func haveLinkToPrefix(_ pre: Data) -> Bool {
+        mapLock.lock(); defer { mapLock.unlock() }
+        return linksByPeerId.keys.contains { $0.prefix(6) == pre }
+    }
 
     private func printStatus() {
-        if linksByPeerId.isEmpty {
+        mapLock.lock(); let links = Array(linksByPeerId.values); mapLock.unlock()
+        if links.isEmpty {
             log("STATUS", "links=0")
             return
         }
-        let detail = linksByPeerId.values
+        let detail = links
             .map { "peer=\($0.peerShort)/rx=\($0.rx)/tx=\($0.tx)/rtt=\($0.rttMs)ms/\($0.isDialer ? "dialer" : "acceptor")" }
             .joined(separator: " ")
-        log("STATUS", "links=\(linksByPeerId.count) \(detail)")
+        log("STATUS", "links=\(links.count) \(detail)")
     }
 
-    private func onUp(_ link: Link) {               // HELLO completed: surface to sink, then dedup
+    private func onUp(_ link: Link) {               // HELLO completed: dedup, then surface the survivor
         guard let peer = link.peerId else { return }
+        // apple-12: dedup BEFORE surfacing. The clean room surfaced both legs of a duplicate pair and
+        // let dedup close the loser afterwards, which handed the node a doomed handshake start + teardown
+        // per simultaneous mutual dial (handshake churn, plausible securing-stuck / link-id-churn cause).
+        // Now the loser never reaches sink.linkUp: only the survivor is announced.
+        mapLock.lock()
         linksByLinkId[link.linkId] = link           // register for send routing + linkDown pairing
-        // Surface BEFORE dedup (matches the clean-room "LINK UP" timing: both legs of a duplicate pair
-        // come up, then dedup closes the loser -> the consumer sees that loser's linkDown).
-        sink?.linkUp(link.linkId, role: link.isDialer ? .dialer : .acceptor, peerId: peer)
-
-        guard let existing = linksByPeerId[peer], existing !== link else {      // SPEC §2.3 dedup
-            linksByPeerId[peer] = link
+        let existing = linksByPeerId[peer]
+        var drop: Link? = nil
+        if let existing, existing !== link {        // SPEC §2.3 dedup
+            let keepDialed = gt(myId, peer)         // keep MY dialed channel iff I'm the greater id
+            let keep = [existing, link].first { $0.isDialer == keepDialed } ?? link
+            drop = (keep === link) ? existing : link
+            linksByPeerId[peer] = keep              // SPEC R3: set survivor BEFORE closing the dropped channel
+            if keep === link { link.wasSurfaced = true }   // only the survivor is announced (apple-12)
+            mapLock.unlock()
+            if let drop {
+                log("DEDUP", "kept isDialer=\(keep.isDialer) peer=\(shortHex(peer))")
+                // Close the loser. It was never surfaced, so onClose emits no linkDown for it.
+                drop.close("dedup")
+            }
+            if keep === link {                      // this leg is the survivor -> announce it now
+                sink?.linkUp(link.linkId, role: link.isDialer ? .dialer : .acceptor, peerId: peer)
+            }
             return
         }
-        let keepDialed = gt(myId, peer)             // keep MY dialed channel iff I'm the greater id
-        let keep = [existing, link].first { $0.isDialer == keepDialed } ?? link
-        let drop = (keep === link) ? existing : link
-        linksByPeerId[peer] = keep                  // SPEC R3: set survivor BEFORE closing the dropped channel
-        drop.close("dedup")
-        log("DEDUP", "kept isDialer=\(keep.isDialer) peer=\(shortHex(peer))")
+        linksByPeerId[peer] = link                  // first (or same) link for this peer -> the survivor
+        link.wasSurfaced = true
+        mapLock.unlock()
+        sink?.linkUp(link.linkId, role: link.isDialer ? .dialer : .acceptor, peerId: peer)
     }
 
     private func onData(_ link: Link, _ bytes: Data) {
@@ -825,13 +870,20 @@ public final class BleBearer: Bearer {
     }
 
     private func onClose(_ link: Link) {            // SPEC R3: identity-checked removal
-        let wasUp = linksByLinkId.removeValue(forKey: link.linkId) != nil       // true iff linkUp had fired
+        mapLock.lock()
+        let wasUp = linksByLinkId.removeValue(forKey: link.linkId) != nil        // true iff registered in onUp
         if let peer = link.peerId, linksByPeerId[peer] === link { linksByPeerId.removeValue(forKey: peer) }
-        if wasUp { sink?.linkDown(link.linkId) }    // pair every linkDown with a prior linkUp
+        mapLock.unlock()
+        // A deduped loser never reached sink.linkUp (apple-12), so it must not emit a linkDown either.
+        // `link.wasSurfaced` records whether onUp announced this exact leg to the sink.
+        if wasUp && link.wasSurfaced { sink?.linkDown(link.linkId) }             // pair every linkDown with a prior linkUp
     }
 
     private func closeAllLinks() {                  // SPEC R11: drop all local links on power-off / stop
-        for l in linksByPeerId.values { l.close("power-off") }
+        // close() invalidates the link's RunLoop timers + closes its streams, which must happen on the
+        // thread that owns bleRunLoop (CFRunLoop thread-affinity). onPowerOff fires on bleQueue, so hop.
+        mapLock.lock(); let links = Array(linksByPeerId.values); mapLock.unlock()
+        bleRunLoop.perform { for l in links { l.close("power-off") } }
     }
 
     /// Called from the iOS AppDelegate on a CoreLocation region wake.
