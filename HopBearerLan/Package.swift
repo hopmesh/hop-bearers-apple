@@ -16,5 +16,9 @@ let package = Package(
     targets: [
         // the SDK package (dir "Hop") provides the "Hop" product.
         .target(name: "HopBearerLan", dependencies: [.product(name: "HopContract", package: "Hop")]),
+        // Pure-logic coverage (apple-07): the dedup tiebreaker / survivor pick, the wasSurfaced
+        // link-lifecycle rule (apple-12), the length-prefix deframer, and the Bonjour-name hex parse.
+        // None of these need a live NWConnection, so they run in a headless macOS CI job.
+        .testTarget(name: "HopBearerLanTests", dependencies: ["HopBearerLan"]),
     ]
 )

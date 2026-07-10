@@ -27,10 +27,72 @@ private let LAN_CONNECT_S: Double = 8.0   // F-11: give up a dial that never rea
 private let LAN_RESTART_S: Double = 2.0   // F-11: backoff before restarting a failed listener/browser
 private let LAN_MAX_FRAME = 4 * 1024 * 1024
 
-private let L_HELLO: UInt8 = 0x01
-private let L_PING:  UInt8 = 0x02
-private let L_PONG:  UInt8 = 0x03
-private let L_DATA:  UInt8 = 0x10
+let L_HELLO: UInt8 = 0x01
+let L_PING:  UInt8 = 0x02
+let L_PONG:  UInt8 = 0x03
+let L_DATA:  UInt8 = 0x10
+
+// MARK: - Pure dedup decision (apple-12, extracted so it is unit-testable without an NWConnection) -----
+
+/// The one-pipe-per-peer keep rule the LAN bearer's onUp is built on: on a duplicate pair to one peer,
+/// keep MY dialed leg iff I am the greater id. Two peers make OPPOSITE decisions (the greater keeps its
+/// dialer, the lesser keeps its acceptor), so exactly one physical connection survives. Identical to the
+/// BLE bearer's `gt(myId, peer)` keep-rule; extracted here so the survivor selection is testable with no
+/// radio (an NWConnection cannot be constructed in a unit test, so the Link/dial paths stay device-
+/// tested; the DECISION that governs which leg wins is covered in the tests).
+func lanKeepDialed(myId: Data, peer: Data) -> Bool { nodeIdGreater(myId, peer) }
+
+/// Given a duplicate pair (the already-registered `existingIsDialer` and the just-arrived `newIsDialer`)
+/// to `peer`, return true iff the NEW leg is the survivor. Mirror of onUp's survivor pick: keep the leg
+/// whose isDialer matches `lanKeepDialed`, falling back to the new leg if neither matches (defensive; in
+/// practice a real duplicate always has one dialer + one acceptor). Pure — no link objects, no I/O.
+func lanNewLegSurvives(myId: Data, peer: Data, existingIsDialer: Bool, newIsDialer: Bool) -> Bool {
+    let keepDialed = lanKeepDialed(myId: myId, peer: peer)
+    // The survivor is the first of [existing, new] whose isDialer == keepDialed, else the new leg.
+    if existingIsDialer == keepDialed { return false }   // existing is the survivor
+    if newIsDialer == keepDialed { return true }         // new is the survivor
+    return true                                          // neither matched -> new leg (defensive)
+}
+
+// MARK: - Pure deframer (extracted from LanLink so the wire format is unit-testable without a socket) --
+
+/// Streaming deframer for the LAN wire format: a 4-byte big-endian length prefix followed by `len` body
+/// bytes (body[0] is the 1-byte frame type). Feed it whatever arrived off the socket; it emits every
+/// COMPLETE frame body and retains any partial tail for the next feed. `overLimit` flags a length that
+/// exceeds LAN_MAX_FRAME or is < 1 (a `bad len` the link closes on), so the socket path can tear down.
+///
+/// This is the exact byte math LanLink.deframe() runs, lifted into a value type: no NWConnection, no
+/// timers, no side effects, so partial frames / back-to-back frames / oversized-length rejection are all
+/// unit-testable. LanLink holds one of these and forwards each emitted body to `handle`.
+struct LanDeframer {
+    private var inBuf = [UInt8]()
+
+    /// Append `bytes`, then pop every complete frame body. Sets `overLimit` and stops if a length is out
+    /// of range (the caller closes the link on that). Bodies are returned in arrival order.
+    mutating func feed(_ bytes: [UInt8], overLimit: inout Bool) -> [[UInt8]] {
+        overLimit = false
+        inBuf.append(contentsOf: bytes)
+        var out = [[UInt8]]()
+        while inBuf.count >= 4 {
+            let len = Int(inBuf[0]) << 24 | Int(inBuf[1]) << 16 | Int(inBuf[2]) << 8 | Int(inBuf[3])
+            guard len >= 1, len <= LAN_MAX_FRAME else { overLimit = true; return out }
+            let total = 4 + len
+            guard inBuf.count >= total else { break }   // partial frame — wait for more bytes
+            out.append(Array(inBuf[4..<total]))
+            inBuf.removeFirst(total)
+        }
+        return out
+    }
+
+    var bufferedCount: Int { inBuf.count }
+}
+
+/// Build a 4-byte big-endian length-prefixed frame around `body`. The inverse of LanDeframer; shared so a
+/// test can round-trip frame -> deframe without reaching into LanLink's socket send.
+func lanFrame(_ body: [UInt8]) -> [UInt8] {
+    let len = UInt32(body.count)
+    return [UInt8(len >> 24 & 0xff), UInt8(len >> 16 & 0xff), UInt8(len >> 8 & 0xff), UInt8(len & 0xff)] + body
+}
 
 // MARK: - LanLink: one TCP NWConnection, same framing/keepalive/HELLO grammar as the BLE link --------
 
@@ -40,11 +102,16 @@ final class LanLink {
     private let myId: Data
     private(set) var peerId: Data?
     private(set) var up = false
+    // apple-12: set true by the bearer iff this exact leg was announced to the sink via linkUp. A
+    // deduped loser is closed without ever being surfaced, so its onClose must NOT emit a linkDown.
+    // Touched only from bearer code on `lanQueue` (single-threaded), so no extra synchronization here.
+    var wasSurfaced = false
 
     private let conn: NWConnection
     private let queue: DispatchQueue
-    private var inBuf = [UInt8]()       // [UInt8], NOT Data: Data's Int subscript is not 0-based after
-                                        // removeFirst, which crashes deframe() (matches the BLE Link).
+    private var deframer = LanDeframer()   // the pure length-prefix parser (unit-tested separately). It
+                                           // buffers [UInt8], NOT Data: Data's Int subscript is not
+                                           // 0-based after removeFirst (matches the BLE Link).
     private var lastRxMs = nowMs()
     private let openedMs = nowMs()
     private var txSeq: UInt64 = 0
@@ -143,9 +210,8 @@ final class LanLink {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let data, !data.isEmpty {
-                self.inBuf.append(contentsOf: data)
                 self.lastRxMs = nowMs()
-                self.deframe()
+                self.deframe([UInt8](data))
             }
             if let error { self.close("recv \(error)"); return }
             if isComplete { self.close("recv EOF"); return }
@@ -153,15 +219,11 @@ final class LanLink {
         }
     }
 
-    private func deframe() {
-        while inBuf.count >= 4 {
-            let len = Int(inBuf[0]) << 24 | Int(inBuf[1]) << 16 | Int(inBuf[2]) << 8 | Int(inBuf[3])
-            guard len >= 1, len <= LAN_MAX_FRAME else { close("bad len \(len)"); return }
-            let total = 4 + len
-            guard inBuf.count >= total else { break }
-            handle(Array(inBuf[4..<total]))
-            inBuf.removeFirst(total)
-        }
+    private func deframe(_ bytes: [UInt8]) {
+        var overLimit = false
+        let frames = deframer.feed(bytes, overLimit: &overLimit)
+        for f in frames { handle(f) }
+        if overLimit { close("bad len") }
     }
 
     private func handle(_ b: [UInt8]) {
@@ -364,31 +426,44 @@ public final class LanBearer: Bearer {
 
     private func onUp(_ link: LanLink) {
         guard let peer = link.peerId else { return }
-        linksByLinkId[link.linkId] = link
-        sink?.linkUp(link.linkId, role: link.isDialer ? .dialer : .acceptor, peerId: peer)  // surface, then dedup
+        // apple-12: dedup BEFORE surfacing (mirrors the BLE bearer). Surfacing both legs of a duplicate
+        // pair and closing the loser afterwards hands the node a doomed handshake start + teardown per
+        // simultaneous mutual dial. Now the loser never reaches sink.linkUp: only the survivor is
+        // announced, and only the survivor carries wasSurfaced so only it can emit a linkDown later.
+        linksByLinkId[link.linkId] = link           // register for send routing + linkDown pairing
         if let existing = linksByPeerId[peer], existing !== link {
-            let keepDialed = nodeIdGreater(myId, peer)
+            let keepDialed = nodeIdGreater(myId, peer)      // keep MY dialed leg iff I'm the greater id
             let keep = [existing, link].first { $0.isDialer == keepDialed } ?? link
             let drop = (keep === link) ? existing : link
-            linksByPeerId[peer] = keep
-            drop.close("dedup")
+            linksByPeerId[peer] = keep                      // set survivor BEFORE closing the dropped leg
+            if keep === link { link.wasSurfaced = true }    // only the survivor is announced (apple-12)
+            drop.close("dedup")                             // loser was never surfaced -> no linkDown for it
             log("DEDUP", "lan kept isDialer=\(keep.isDialer) peer=\(shortHex(peer))")
-        } else {
-            linksByPeerId[peer] = link
+            if keep === link {                              // this leg is the survivor -> announce it now
+                sink?.linkUp(link.linkId, role: link.isDialer ? .dialer : .acceptor, peerId: peer)
+            }
+            return
         }
+        linksByPeerId[peer] = link                  // first (or same) link for this peer -> the survivor
+        link.wasSurfaced = true
+        sink?.linkUp(link.linkId, role: link.isDialer ? .dialer : .acceptor, peerId: peer)
     }
 
     private func onData(_ link: LanLink, _ bytes: Data) { sink?.linkBytes(link.linkId, bytes) }
 
     private func onClose(_ link: LanLink) {
-        let wasUp = linksByLinkId.removeValue(forKey: link.linkId) != nil
+        let wasUp = linksByLinkId.removeValue(forKey: link.linkId) != nil        // true iff registered in onUp
         if let peer = link.peerId, linksByPeerId[peer] === link { linksByPeerId.removeValue(forKey: peer) }
-        if wasUp { sink?.linkDown(link.linkId) }
+        // apple-12: a deduped loser never reached sink.linkUp, so it must not emit a linkDown either.
+        // `link.wasSurfaced` records whether onUp announced this exact leg to the sink, so every linkDown
+        // pairs with a prior linkUp (mirrors the BLE bearer).
+        if wasUp && link.wasSurfaced { sink?.linkDown(link.linkId) }
     }
 }
 
-/// The Bonjour instance name is the peer's 32-hex-char nodeId. Parse it back to 16 bytes.
-private func peerIdFromName(_ name: String) -> Data? {
+/// The Bonjour instance name is the peer's 32-hex-char nodeId. Parse it back to 16 bytes. Internal
+/// (not private) so the pure-logic tests can exercise the hex round-trip without a live browser.
+func peerIdFromName(_ name: String) -> Data? {
     guard name.count == 32 else { return nil }
     var d = Data(capacity: 16); var i = name.startIndex
     while i < name.endIndex {

@@ -78,6 +78,41 @@ func gt(_ a: Data, _ b: Data) -> Bool {
     return a.count > b.count
 }
 
+// MARK: - Pure deframer (SPEC §4 framing, extracted so the wire format is unit-testable) ----------
+
+/// Streaming deframer for the BLE wire format: a 4-byte big-endian length prefix followed by `len` body
+/// bytes (body[0] is the 1-byte frame type). Feed it whatever the L2CAP input stream produced; it emits
+/// every COMPLETE frame body and retains a partial tail. `overLimit` flags a length < 1 or > MAX_FRAME
+/// (the `bad len` the link closes on). Byte-for-byte the math in Link.deframe(), lifted into a value type
+/// so partial / back-to-back / oversized-length behavior is testable without a CBL2CAPChannel.
+struct BleDeframer {
+    private var inBuf = [UInt8]()
+
+    mutating func feed(_ bytes: [UInt8], overLimit: inout Bool) -> [[UInt8]] {
+        overLimit = false
+        inBuf.append(contentsOf: bytes)
+        var out = [[UInt8]]()
+        while inBuf.count >= 4 {
+            let len = Int(UInt32(inBuf[0]) << 24 | UInt32(inBuf[1]) << 16 | UInt32(inBuf[2]) << 8 | UInt32(inBuf[3]))
+            guard len >= 1, len <= MAX_FRAME else { overLimit = true; return out }
+            let total = 4 + len
+            guard inBuf.count >= total else { break }   // partial frame — wait for more bytes
+            out.append(Array(inBuf[4..<total]))
+            inBuf.removeFirst(total)
+        }
+        return out
+    }
+
+    var bufferedCount: Int { inBuf.count }
+}
+
+/// Build a 4-byte big-endian length-prefixed frame around `body` (the inverse of BleDeframer). Shared so
+/// a test can round-trip frame -> deframe without reaching into Link's L2CAP output stream.
+func bleFrame(_ body: [UInt8]) -> [UInt8] {
+    let len = UInt32(body.count)
+    return [UInt8(len >> 24 & 0xff), UInt8(len >> 16 & 0xff), UInt8(len >> 8 & 0xff), UInt8(len & 0xff)] + body
+}
+
 // MARK: - Liveness verdict (apple-02(b), pure + testable) ----------------------------------------
 
 /// What the watchdog should do this tick. Extracted as a pure function so the suspend-aware liveness
@@ -185,7 +220,7 @@ final class Link: NSObject, StreamDelegate {
     private let channel: CBL2CAPChannel
     private let input: InputStream
     private let output: OutputStream
-    private var inBuf = [UInt8]()
+    private var deframer = BleDeframer()   // the pure length-prefix parser (unit-tested separately)
     private var outBuf = [UInt8]()
 
     private var lastRxMs = nowMs()
@@ -333,25 +368,22 @@ final class Link: NSObject, StreamDelegate {
 
     private func read() {
         var tmp = [UInt8](repeating: 0, count: 16384)
+        var got = [UInt8]()
         while input.hasBytesAvailable {
             let n = input.read(&tmp, maxLength: tmp.count)
-            if n > 0 { inBuf.append(contentsOf: tmp[0..<n]) } else { break }
+            if n > 0 { got.append(contentsOf: tmp[0..<n]) } else { break }
         }
         let gap = Double(nowMs() - lastRxMs)
         ewmaGapMs = 0.8 * ewmaGapMs + 0.2 * gap
         lastRxMs = nowMs()
-        deframe()
+        deframe(got)
     }
 
-    private func deframe() {
-        while inBuf.count >= 4 {
-            let len = Int(UInt32(inBuf[0]) << 24 | UInt32(inBuf[1]) << 16 | UInt32(inBuf[2]) << 8 | UInt32(inBuf[3]))
-            guard len >= 1, len <= MAX_FRAME else { close("bad len \(len)"); return }
-            let total = 4 + len
-            guard inBuf.count >= total else { break }
-            handle(Array(inBuf[4..<total]))
-            inBuf.removeFirst(total)
-        }
+    private func deframe(_ bytes: [UInt8]) {
+        var overLimit = false
+        let frames = deframer.feed(bytes, overLimit: &overLimit)
+        for f in frames { handle(f) }
+        if overLimit { close("bad len") }
     }
 
     private func handle(_ b: [UInt8]) {
