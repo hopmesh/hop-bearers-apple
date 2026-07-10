@@ -119,18 +119,49 @@ func livenessVerdict(up: Bool, openedGapS: Double, rxGapS: Double, tickGapS: Dou
 // existing wait-timeout fires and Android dials the (advertising) iPhone as acceptor. No deadlock, no
 // protocol change — iOS just biases toward WAIT while backgrounded.
 
-/// Should THIS central dial the discovered peer now? `appInBackground` is iOS's suspend-prone state.
-/// `haveKnownPrefix` is whether we learned the peer's 6-byte id from its advert (needed for the
-/// tiebreak). Pure: the caller passes the tiebreak result so this has no crypto/Data dependency.
+/// Should THIS central dial the discovered peer IMMEDIATELY (no wait)? `appInBackground` is iOS's
+/// suspend-prone state. `haveKnownPrefix` is whether we learned the peer's 6-byte id from its advert
+/// (needed for the tiebreak). Pure: the caller passes the tiebreak result so this has no crypto/Data
+/// dependency.
+///
+/// apple-r2-02: a `false` return does NOT mean "never dial". It means "defer": the caller enters the
+/// WAIT_BASE_S pending-wait, and if the peer still has not dialed us by the timeout, the caller dials as
+/// a fallback so a link ALWAYS forms (no deadlock, no starvation between two backgrounded iPhones with no
+/// Android present). Backgrounded iOS is therefore ACCEPTOR-BIASED (it waits WAIT_BASE_S before dialing),
+/// not a pure never-dialer. Keeping the fallback is deliberate: dropping it to enforce a hard "never dial
+/// backgrounded" would black-hole iOS<->iOS link formation when no peer volunteers to dial.
 func shouldDialNow(appInBackground: Bool, haveKnownPrefix: Bool, tiebreakSaysDial: Bool) -> Bool {
     // Unknown peer (no advertised prefix): we cannot run the tiebreak, so we must dial to make any
-    // progress — this is the only way to learn the peer at all. Applies even when backgrounded.
+    // progress. This is the only way to learn the peer at all. Applies even when backgrounded.
     guard haveKnownPrefix else { return true }
-    // Backgrounded iOS: never dial. Advertise + accept; let the peer (Android) dial us. The peer's
-    // wait-timeout fallback guarantees the link still forms even if BOTH sides would normally wait.
+    // Backgrounded iOS: do not dial NOW. Advertise + accept and let the peer (Android) dial us; the
+    // caller's wait-timeout is the fallback that still dials if no one does.
     if appInBackground { return false }
-    // Foreground: the plain SPEC §2.1 tiebreaker — greater id dials.
+    // Foreground: the plain SPEC §2.1 tiebreaker. Greater id dials.
     return tiebreakSaysDial
+}
+
+/// apple-r2-02: the two outcomes of `didDiscover` for a known peer, made explicit + pure so the
+/// deferral semantics are testable without a CoreBluetooth radio. `.dialNow` dials immediately;
+/// `.deferThenFallbackDial` enters the WAIT_BASE_S pending-wait and, if the peer has not dialed us by
+/// the timeout, dials as a fallback (so a link ALWAYS forms). A backgrounded iOS central maps to
+/// `.deferThenFallbackDial`, NOT to a "never dial" state: it is acceptor-biased, not a pure never-dialer.
+enum DiscoverAction: Equatable { case dialNow, deferThenFallbackDial }
+
+func discoverAction(appInBackground: Bool, haveKnownPrefix: Bool, tiebreakSaysDial: Bool) -> DiscoverAction {
+    shouldDialNow(appInBackground: appInBackground,
+                  haveKnownPrefix: haveKnownPrefix,
+                  tiebreakSaysDial: tiebreakSaysDial) ? .dialNow : .deferThenFallbackDial
+}
+
+/// Does the WAIT_BASE_S wait-timeout fallback dial the peer, given whether the peer dialed us first?
+/// This models the closure body at `didDiscover`'s pendingWaits branch: it dials iff no link formed
+/// meanwhile (the peer did not dial us and we are not already dialing it). This is the liveness
+/// guarantee that makes deferral safe even when BOTH peers are backgrounded and neither would dial now.
+func waitTimeoutDials(peerAlreadyDialedUs: Bool, weAreAlreadyDialing: Bool) -> Bool {
+    if peerAlreadyDialedUs { return false }   // link already formed via the acceptor path
+    if weAreAlreadyDialing { return false }   // we started a dial in the meantime
+    return true                               // fallback: dial so the link forms no matter what
 }
 
 // MARK: - Link: one L2CAP channel, 4-byte BE framing, 1 Hz PING (keepalive), adaptive watchdog -----
@@ -643,8 +674,10 @@ final class Central: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         if let until = backoff[bkey], nowS() < until { return }                 // SPEC R2: rate-limited
         if let pre = advPrefix, haveLinkToPrefix(pre) { return }                 // SPEC R4: already linked
         guard retained[p.identifier] == nil else { return }                     // already dialing
-        // apple-02(c) / issue /548: a backgrounded iOS Central defers dialing (becomes acceptor) so the
-        // Android peer dials the advertising iPhone; foreground keeps the plain SPEC §2.1 tiebreaker.
+        // apple-02(c) / issue /548 / apple-r2-02: a backgrounded iOS Central DEFERS dialing by WAIT_BASE_S
+        // (acceptor-biased) so the Android peer dials the advertising iPhone first; if no peer dials us in
+        // that window the wait-timeout below still dials as a fallback. Foreground keeps the plain SPEC
+        // §2.1 tiebreaker.
         let dialNow = shouldDialNow(appInBackground: bleAppInBackground,
                                     haveKnownPrefix: advPrefix != nil,
                                     tiebreakSaysDial: advPrefix.map { gt(myId.prefix(6), $0) } ?? true)
@@ -655,8 +688,11 @@ final class Central: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             bleQueue.asyncAfter(deadline: .now() + WAIT_BASE_S + Double.random(in: 0...1)) { [weak self] in
                 guard let self else { return }
                 self.pendingWaits.remove(p.identifier)
-                if let pre = advPrefix, self.haveLinkToPrefix(pre) { return }    // SPEC R4: gate on link map
-                if self.retained[p.identifier] != nil { return }
+                // apple-r2-02: the deferral (incl. a backgrounded iOS acceptor) still dials as a fallback
+                // iff no link formed meanwhile: the peer never dialed us AND we aren't already dialing it.
+                let peerDialedUs = advPrefix.map { self.haveLinkToPrefix($0) } ?? false
+                guard waitTimeoutDials(peerAlreadyDialedUs: peerDialedUs,
+                                       weAreAlreadyDialing: self.retained[p.identifier] != nil) else { return }
                 log("STATE", "wait-timeout fired -> dialing id=\(p.identifier.uuidString.prefix(8))")
                 self.dial(c, p, advPrefix)
             }

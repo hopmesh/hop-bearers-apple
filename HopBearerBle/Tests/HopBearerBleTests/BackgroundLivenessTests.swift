@@ -114,6 +114,47 @@ final class BackgroundLivenessTests: XCTestCase {
         XCTAssertNotEqual(greaterDials, lesserDials)
     }
 
+    // MARK: apple-r2-02: deferral is NOT "never dial"; the wait-timeout fallback still forms the link.
+
+    /// A backgrounded iOS central maps to `.deferThenFallbackDial`, never a silent no-dial. This pins the
+    /// corrected invariant (the old comment claimed "never dial", but didDiscover defers then falls back).
+    func testBackgroundedKnownPeerDefersButDoesNotNeverDial() {
+        XCTAssertEqual(discoverAction(appInBackground: true, haveKnownPrefix: true, tiebreakSaysDial: true),
+                       .deferThenFallbackDial)
+        XCTAssertEqual(discoverAction(appInBackground: true, haveKnownPrefix: true, tiebreakSaysDial: false),
+                       .deferThenFallbackDial)
+    }
+
+    /// A foregrounded greater id dials immediately; unknown peers dial immediately regardless of bg.
+    func testForegroundGreaterAndUnknownDialImmediately() {
+        XCTAssertEqual(discoverAction(appInBackground: false, haveKnownPrefix: true, tiebreakSaysDial: true),
+                       .dialNow)
+        XCTAssertEqual(discoverAction(appInBackground: true, haveKnownPrefix: false, tiebreakSaysDial: false),
+                       .dialNow)
+    }
+
+    /// THE apple-r2-02 regression guard: two backgrounded peers BOTH defer, so neither dials immediately.
+    /// The link therefore depends entirely on the wait-timeout fallback dialing, proving the fallback is
+    /// load-bearing and must NOT be removed (removing it to enforce a hard "never dial backgrounded" would
+    /// black-hole iOS<->iOS link formation with no Android present).
+    func testTwoBackgroundedPeersBothDeferSoFallbackIsRequired() {
+        let a = discoverAction(appInBackground: true, haveKnownPrefix: true, tiebreakSaysDial: true)
+        let b = discoverAction(appInBackground: true, haveKnownPrefix: true, tiebreakSaysDial: false)
+        XCTAssertEqual(a, .deferThenFallbackDial)
+        XCTAssertEqual(b, .deferThenFallbackDial)
+        // With neither dialing now, the fallback for at least one side must dial (peer has not dialed us,
+        // we are not already dialing) so a link forms.
+        XCTAssertTrue(waitTimeoutDials(peerAlreadyDialedUs: false, weAreAlreadyDialing: false))
+    }
+
+    /// The fallback is suppressed once a link has formed (peer dialed us) or we already started a dial,
+    /// so it never opens a duplicate second leg.
+    func testWaitTimeoutSuppressedWhenLinkAlreadyForming() {
+        XCTAssertFalse(waitTimeoutDials(peerAlreadyDialedUs: true, weAreAlreadyDialing: false))
+        XCTAssertFalse(waitTimeoutDials(peerAlreadyDialedUs: false, weAreAlreadyDialing: true))
+        XCTAssertFalse(waitTimeoutDials(peerAlreadyDialedUs: true, weAreAlreadyDialing: true))
+    }
+
     // MARK: (a) background-task assertion — BackgroundAssertion lifecycle
 
     /// On macOS the assertion is a compiled no-op; the calls must be safe and non-crashing regardless of
