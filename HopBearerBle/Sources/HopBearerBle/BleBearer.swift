@@ -43,6 +43,14 @@ let MAX_FRAME = 4 * 1024 * 1024
 let STABLE_UP_MS: UInt64 = 30_000
 let LOST_S: Double = 30.0
 
+// apple-02(b): suspend-aware liveness. The watchdog is a 1 Hz RunLoop timer; while iOS suspends the
+// process, no timers fire and wall-clock keeps advancing, so on wake `nowMs() - lastRxMs` looks like a
+// long RX silence and the link would be reaped as "liveness DEAD" even though the peer is fine — we
+// were merely asleep. If the gap between two successive watchdog ticks exceeds SUSPEND_GAP_S the
+// process was suspended, so instead of reaping we grant one grace window (reset the RX clock + probe
+// with a PING) and only reap on a subsequent tick if the peer really is gone.
+let SUSPEND_GAP_S: Double = 3.0     // a tick gap larger than this means we were suspended, not idle
+
 // Wire frame types (SPEC §4). The DATA type is the consumer seam: Bearer.send wraps the consumer's
 // application bytes in a DATA frame, and an inbound DATA frame is delivered via sink.linkBytes. The
 // PING/PONG types are the transport's own keepalive and never reach the consumer.
@@ -68,6 +76,61 @@ public var bleAppInBackground = false
 func gt(_ a: Data, _ b: Data) -> Bool {
     for i in 0..<min(a.count, b.count) where a[i] != b[i] { return a[i] > b[i] }
     return a.count > b.count
+}
+
+// MARK: - Liveness verdict (apple-02(b), pure + testable) ----------------------------------------
+
+/// What the watchdog should do this tick. Extracted as a pure function so the suspend-aware liveness
+/// logic is unit-testable without a CoreBluetooth channel (a `Link` can't be built in a unit test).
+enum LivenessVerdict: Equatable {
+    case keep            // link healthy — do nothing
+    case reapNoHello     // half-open past REAP_S with no HELLO — reap
+    case reapDead        // real RX silence past the deadline — reap
+    case suspendGrace    // the process was suspended across this tick — grant grace, probe, don't reap
+}
+
+/// Decide the watchdog action. `tickGapS` is the wall-clock gap since the previous watchdog tick: a gap
+/// far larger than the 1 s tick cadence means the process was suspended (iOS froze our timers), so a
+/// stale RX clock reflects our sleep, not a dead peer. In that case we grant one grace window instead of
+/// reaping. Pure: no globals, no clock reads — the caller passes every input.
+func livenessVerdict(up: Bool, openedGapS: Double, rxGapS: Double, tickGapS: Double, deadLimitS: Double) -> LivenessVerdict {
+    // A large tick gap means we just resumed from suspension. The RX clock was frozen with us, so it
+    // cannot distinguish "peer went quiet" from "we were asleep" — grant grace and probe (both when
+    // still handshaking and when up), so a suspended receiver never self-reaps a live inbound path.
+    if tickGapS > SUSPEND_GAP_S {
+        return .suspendGrace
+    }
+    if !up {
+        return openedGapS > REAP_S ? .reapNoHello : .keep
+    }
+    return rxGapS > deadLimitS ? .reapDead : .keep
+}
+
+// MARK: - Dial decision (apple-02(c) / issue /548, pure + testable) ------------------------------
+//
+// "Android dials iOS" bias. A backgrounded iOS Central cannot scan/dial reliably (iOS throttles bg
+// scanning hard and suspends the process), but iOS DOES accept an inbound L2CAP channel in the
+// background via CoreBluetooth state restoration. So a backgrounded iOS peer should be the ACCEPTOR:
+// it keeps advertising (peripheral) and lets the peer dial it, instead of trying to dial out.
+//
+// The base tiebreaker (SPEC §2.1) is symmetric: the greater 6-byte id dials, the lesser waits, and the
+// waiter's WAIT_BASE_S fallback dials anyway if the greater side never does. That fallback is what makes
+// deferring safe: if a backgrounded iOS peer declines to dial even as the greater id, the Android peer's
+// existing wait-timeout fires and Android dials the (advertising) iPhone as acceptor. No deadlock, no
+// protocol change — iOS just biases toward WAIT while backgrounded.
+
+/// Should THIS central dial the discovered peer now? `appInBackground` is iOS's suspend-prone state.
+/// `haveKnownPrefix` is whether we learned the peer's 6-byte id from its advert (needed for the
+/// tiebreak). Pure: the caller passes the tiebreak result so this has no crypto/Data dependency.
+func shouldDialNow(appInBackground: Bool, haveKnownPrefix: Bool, tiebreakSaysDial: Bool) -> Bool {
+    // Unknown peer (no advertised prefix): we cannot run the tiebreak, so we must dial to make any
+    // progress — this is the only way to learn the peer at all. Applies even when backgrounded.
+    guard haveKnownPrefix else { return true }
+    // Backgrounded iOS: never dial. Advertise + accept; let the peer (Android) dial us. The peer's
+    // wait-timeout fallback guarantees the link still forms even if BOTH sides would normally wait.
+    if appInBackground { return false }
+    // Foreground: the plain SPEC §2.1 tiebreaker — greater id dials.
+    return tiebreakSaysDial
 }
 
 // MARK: - Link: one L2CAP channel, 4-byte BE framing, 1 Hz PING (keepalive), adaptive watchdog -----
@@ -97,6 +160,7 @@ final class Link: NSObject, StreamDelegate {
     private var lastRxMs = nowMs()
     private let openedMs = nowMs()
     private var becameUpMs: UInt64?
+    private var lastTickMs = nowMs()                // apple-02(b): detect suspension via tick-gap
     private var ewmaGapMs = 1000.0                  // inbound inter-arrival EWMA (SPEC R7)
     private var txSeq: UInt64 = 0                   // our keepalive PING counter (STATUS tx)
     private var rxSeq: UInt64 = 0                   // peer's keepalive PING counter (STATUS rx)
@@ -161,8 +225,26 @@ final class Link: NSObject, StreamDelegate {
     }
 
     private func tick() {
-        if !up && Double(nowMs() - openedMs) / 1000 > REAP_S { close("no-HELLO reap"); return }
-        if up && Double(nowMs() - lastRxMs) / 1000 > deadLimitS() { close("liveness DEAD") }
+        let now = nowMs()
+        let tickGapS = Double(now - lastTickMs) / 1000
+        lastTickMs = now
+        switch livenessVerdict(up: up, openedGapS: Double(now - openedMs) / 1000,
+                               rxGapS: Double(now - lastRxMs) / 1000,
+                               tickGapS: tickGapS, deadLimitS: deadLimitS()) {
+        case .keep:
+            break
+        case .reapNoHello:
+            close("no-HELLO reap")
+        case .reapDead:
+            close("liveness DEAD")
+        case .suspendGrace:
+            // apple-02(b): we were suspended across this interval, not idle. Don't count the sleep
+            // against the peer: reset the RX clock and probe once. Only a subsequent tick with real
+            // silence (peer actually gone) will reap.
+            log("STATE", "liveness suspend-grace (tickGap=\(String(format: "%.1f", tickGapS))s) peer=\(peerShort) — probing instead of reaping")
+            lastRxMs = now
+            sendPing()
+        }
     }
 
     private func sendPing() {
@@ -561,8 +643,12 @@ final class Central: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         if let until = backoff[bkey], nowS() < until { return }                 // SPEC R2: rate-limited
         if let pre = advPrefix, haveLinkToPrefix(pre) { return }                 // SPEC R4: already linked
         guard retained[p.identifier] == nil else { return }                     // already dialing
-        let dialNow = advPrefix.map { gt(myId.prefix(6), $0) } ?? true          // SPEC §2.1 (no prefix => dial)
-        log("STATE", "discovered id=\(p.identifier.uuidString.prefix(8)) prefix=\(advPrefix.map(hex) ?? "none") rssi=\(rssi) decision=\(dialNow ? "DIAL" : "WAIT")")
+        // apple-02(c) / issue /548: a backgrounded iOS Central defers dialing (becomes acceptor) so the
+        // Android peer dials the advertising iPhone; foreground keeps the plain SPEC §2.1 tiebreaker.
+        let dialNow = shouldDialNow(appInBackground: bleAppInBackground,
+                                    haveKnownPrefix: advPrefix != nil,
+                                    tiebreakSaysDial: advPrefix.map { gt(myId.prefix(6), $0) } ?? true)
+        log("STATE", "discovered id=\(p.identifier.uuidString.prefix(8)) prefix=\(advPrefix.map(hex) ?? "none") rssi=\(rssi) bg=\(bleAppInBackground) decision=\(dialNow ? "DIAL" : "WAIT")")
         if dialNow {
             dial(c, p, advPrefix)
         } else if pendingWaits.insert(p.identifier).inserted {                  // SPEC R4: one wait per peer
@@ -732,6 +818,11 @@ public final class BleBearer: Bearer {
     private var linksByLinkId = [LinkId: Link]()     // send routing + linkUp/linkDown pairing
     private var nextLinkId: LinkId = 1               // minted under mapLock
     private var status: Timer?
+    // apple-02(a): the background-task assertion that keeps an in-flight receive alive across a suspend.
+    // Held while backgrounded WITH at least one live link, renewed on each inbound frame, ended on
+    // foreground / no-links. No-op on macOS (see BackgroundAssertion).
+    private let bgAssertion = BackgroundAssertion()
+    private var appInBackground = false             // mirrors bleAppInBackground for assertion bookkeeping
     #if os(iOS)
     private var beaconWake: BeaconWake?              // the bearer's own iBeacon background-wake monitor
     #endif
@@ -789,6 +880,7 @@ public final class BleBearer: Bearer {
 
     public func stop() {
         status?.invalidate(); status = nil
+        bgAssertion.end("bearer-stop")   // apple-02(a): never strand the assertion
         #if os(iOS)
         beaconWake?.stop(); beaconWake = nil
         #endif
@@ -862,18 +954,43 @@ public final class BleBearer: Bearer {
         linksByPeerId[peer] = link                  // first (or same) link for this peer -> the survivor
         link.wasSurfaced = true
         mapLock.unlock()
+        // apple-02(a): a link came up. If we're already backgrounded, take the assertion now so this
+        // fresh inbound path survives an imminent suspend (e.g. a peer dialed our backgrounded acceptor).
+        if appInBackground { bgAssertion.begin("link-up-bg") }
         sink?.linkUp(link.linkId, role: link.isDialer ? .dialer : .acceptor, peerId: peer)
     }
 
     private func onData(_ link: Link, _ bytes: Data) {
+        // apple-02(a): a DATA frame arrived. If we're backgrounded, push the bg-assertion window out so
+        // an in-flight multi-frame receive can finish before iOS suspends us.
+        if appInBackground { bgAssertion.renew() }
         sink?.linkBytes(link.linkId, bytes)         // one DATA frame -> consumer
+    }
+
+    /// apple-02(a): the host (driver) calls this on every foreground/background transition. On entering
+    /// the background WITH at least one live link, take the UIApplication background-task assertion so a
+    /// suspend does not instantly kill an in-flight inbound receive; on foreground, end it. Also keeps
+    /// the shared `bleAppInBackground` liveness flag in lockstep so the two never drift.
+    public func setBackground(_ background: Bool) {
+        bleAppInBackground = background
+        appInBackground = background
+        if background {
+            mapLock.lock(); let haveLinks = !linksByPeerId.isEmpty; mapLock.unlock()
+            if haveLinks { bgAssertion.begin("bg-with-links") }
+        } else {
+            bgAssertion.end("foreground")
+        }
     }
 
     private func onClose(_ link: Link) {            // SPEC R3: identity-checked removal
         mapLock.lock()
         let wasUp = linksByLinkId.removeValue(forKey: link.linkId) != nil        // true iff registered in onUp
         if let peer = link.peerId, linksByPeerId[peer] === link { linksByPeerId.removeValue(forKey: peer) }
+        let noLinksLeft = linksByPeerId.isEmpty
         mapLock.unlock()
+        // apple-02(a): nothing left to protect once the last link drops — release the assertion so a
+        // backgrounded, link-less app is suspended promptly instead of burning its grace window.
+        if noLinksLeft { bgAssertion.end("no-links") }
         // A deduped loser never reached sink.linkUp (apple-12), so it must not emit a linkDown either.
         // `link.wasSurfaced` records whether onUp announced this exact leg to the sink.
         if wasUp && link.wasSurfaced { sink?.linkDown(link.linkId) }             // pair every linkDown with a prior linkUp
