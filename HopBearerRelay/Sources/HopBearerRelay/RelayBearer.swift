@@ -51,7 +51,7 @@ public final class RelayBearer: NSObject, Bearer {
 
     public init(relayURL: String) {
         self.relayURL = relayURL
-        self.peerId = Data(SHA256.hash(data: Data(relayURL.utf8))).prefix(16)
+        self.peerId = RelayBearer.stablePeerId(forURL: relayURL)
         super.init()
     }
 
@@ -129,14 +129,15 @@ public final class RelayBearer: NSObject, Bearer {
         reconnectScheduled = true
         // F-13: honor a server-driven Retry-After (429) when present; otherwise exponential backoff.
         // Jitter always, so a fleet whose sockets all drop at once (e.g. a relay redeploy) doesn't
-        // reconnect in lockstep.
-        let delay: Double
-        if let ra = retryAfter {
+        // reconnect in lockstep. The delay + backoff-step math is the pure `reconnectDelay`/`nextBackoff`
+        // below; a Retry-After does NOT advance the exponential backoff (only a plain drop does).
+        let jitter = Double.random(in: 0...1)
+        let ra = retryAfter
+        let delay = RelayBearer.reconnectDelay(retryAfter: ra, backoff: backoff, jitter: jitter)
+        if ra != nil {
             retryAfter = nil
-            delay = ra + Double.random(in: 0...1)
         } else {
-            delay = backoff + Double.random(in: 0...1)
-            backoff = min(backoff * 2, RELAY_BACKOFF_MAX_S)
+            backoff = RelayBearer.nextBackoff(backoff)
         }
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
@@ -180,21 +181,55 @@ extension RelayBearer: URLSessionWebSocketDelegate {
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         // F-13: if the WS upgrade was rejected with 429, honor the server's Retry-After instead of
         // hammering it on the normal backoff schedule. Read the response off the task before hopping
-        // queues (it's the HTTP upgrade response for a failed handshake).
-        let retry: Double?
-        if let http = task.response as? HTTPURLResponse, http.statusCode == 429 {
-            if let ra = http.value(forHTTPHeaderField: "Retry-After"), let secs = Double(ra) {
-                retry = secs
-            } else {
-                retry = RELAY_BACKOFF_MAX_S
-            }
-        } else {
-            retry = nil
-        }
+        // queues (it's the HTTP upgrade response for a failed handshake); the parse is the pure
+        // `retryAfterSeconds` below (only 429 backs off this way).
+        let http = task.response as? HTTPURLResponse
+        let retry = RelayBearer.retryAfterSeconds(statusCode: http?.statusCode ?? 0,
+                                                  retryAfterHeader: http?.value(forHTTPHeaderField: "Retry-After"))
         queue.async { [weak self] in
             guard let self, task === self.task else { return }
             if let retry { self.retryAfter = retry; log("STATE", "relay 429 rate-limited; backing off \(retry)s") }
             self.handleDown()
         }
+    }
+}
+
+// MARK: - Pure reconnect/backoff decisions (extracted so unit tests pin them without a live WebSocket) --
+//
+// The relay's whole decision surface is otherwise trapped inside URLSession delegate callbacks and the
+// serial `queue`, which a unit test can't drive. Lift the DECISIONS into pure static functions the class
+// delegates to, so the stable-peerId derivation, the exponential-backoff step, the 429 Retry-After parse,
+// and the jittered reconnect delay are all testable with no socket. Behavior is unchanged: these are the
+// exact expressions the init / scheduleReconnect / didCompleteWithError paths now call.
+extension RelayBearer {
+    /// The minimum / maximum exponential-backoff bounds (F-13), exposed for the tests.
+    static var backoffMinS: Double { RELAY_BACKOFF_MIN_S }
+    static var backoffMaxS: Double { RELAY_BACKOFF_MAX_S }
+
+    /// The stable synthetic 16-byte peer id for a relay URL: SHA-256(url) truncated to 16 bytes. Purely a
+    /// function of the URL, so it is identical every reconnect (the node ignores it, identifying the relay
+    /// via Noise). This is the exact derivation `init` uses.
+    static func stablePeerId(forURL relayURL: String) -> Data {
+        Data(SHA256.hash(data: Data(relayURL.utf8))).prefix(16)
+    }
+
+    /// The next exponential backoff after a plain drop / too-short link: double, capped at the max (F-13).
+    static func nextBackoff(_ current: Double) -> Double { min(current * 2, RELAY_BACKOFF_MAX_S) }
+
+    /// Parse a server-driven Retry-After from a FAILED WS upgrade. Only a 429 backs off this way: a numeric
+    /// Retry-After header is honored verbatim; a 429 with a missing / non-numeric header falls back to the
+    /// max backoff; any non-429 status returns nil (fall back to the normal exponential schedule).
+    static func retryAfterSeconds(statusCode: Int, retryAfterHeader: String?) -> Double? {
+        guard statusCode == 429 else { return nil }
+        if let h = retryAfterHeader, let secs = Double(h) { return secs }
+        return RELAY_BACKOFF_MAX_S
+    }
+
+    /// The reconnect delay: a server Retry-After when present, else the current exponential backoff, plus
+    /// [0,1) jitter (injected here so tests are deterministic) so a whole fleet doesn't reconnect in
+    /// lockstep. A Retry-After does NOT advance the exponential backoff; only a plain drop does (see
+    /// scheduleReconnect, which calls `nextBackoff` only on the no-Retry-After branch).
+    static func reconnectDelay(retryAfter: Double?, backoff: Double, jitter: Double) -> Double {
+        (retryAfter ?? backoff) + jitter
     }
 }

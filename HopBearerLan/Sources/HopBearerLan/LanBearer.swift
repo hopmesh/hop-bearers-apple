@@ -87,6 +87,17 @@ struct LanDeframer {
     var bufferedCount: Int { inBuf.count }
 }
 
+/// The pure dial gate the LAN browser and the rescan-for-dials path SHARE (extracted so it is unit-
+/// testable without a live NWBrowser, and so the two call sites can't drift): from a discovered peer,
+/// dial iff it is NOT us, we are NOT already linked to it, and we are the greater id (the SPEC §2.1
+/// "greater dials" tiebreaker, so exactly one side initiates). The caller still layers its stateful
+/// `dialing`-set dedup (one in-flight dial per peer) on top of this decision.
+func lanShouldDial(myId: Data, peerId: Data, alreadyLinked: Bool) -> Bool {
+    if peerId == myId { return false }        // our own advertised service
+    if alreadyLinked { return false }         // already have a link to this peer
+    return nodeIdGreater(myId, peerId)        // tiebreaker: the greater id dials
+}
+
 /// Build a 4-byte big-endian length-prefixed frame around `body`. The inverse of LanDeframer; shared so a
 /// test can round-trip frame -> deframe without reaching into LanLink's socket send.
 func lanFrame(_ body: [UInt8]) -> [UInt8] {
@@ -364,9 +375,10 @@ public final class LanBearer: Bearer {
             for r in results {
                 guard case let .service(name, _, _, _) = r.endpoint else { continue }
                 guard let peerId = peerIdFromName(name) else { continue }
-                if peerId == self.myId { continue }                          // our own advertised service
-                if self.linksByPeerId[peerId] != nil { continue }            // already linked
-                if !nodeIdGreater(self.myId, peerId) { continue }            // tiebreaker: greater dials
+                // Skip self / already-linked / not-our-turn (the shared pure gate); then the stateful
+                // one-in-flight-dial-per-peer dedup.
+                guard lanShouldDial(myId: self.myId, peerId: peerId,
+                                    alreadyLinked: self.linksByPeerId[peerId] != nil) else { continue }
                 if !self.dialing.insert(hex(peerId)).inserted { continue }   // already dialing this peer
                 log("STATE", "lan discovered peer=\(shortHex(peerId)) -> DIAL")
                 self.dial(r.endpoint, peerId)
@@ -414,8 +426,8 @@ public final class LanBearer: Bearer {
         for r in results {
             guard case let .service(name, _, _, _) = r.endpoint else { continue }
             guard let peerId = peerIdFromName(name) else { continue }
-            if peerId == myId || linksByPeerId[peerId] != nil { continue }
-            if !nodeIdGreater(myId, peerId) { continue }
+            guard lanShouldDial(myId: myId, peerId: peerId,
+                                alreadyLinked: linksByPeerId[peerId] != nil) else { continue }
             if !dialing.insert(hex(peerId)).inserted { continue }
             log("STATE", "lan rescan re-dial peer=\(shortHex(peerId))")
             dial(r.endpoint, peerId)

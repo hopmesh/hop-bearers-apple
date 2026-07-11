@@ -14,5 +14,9 @@ let package = Package(
     ],
     targets: [
         .target(name: "HopBearerRelay", dependencies: [.product(name: "HopContract", package: "Hop")]),
+        // Pure-logic coverage: the stable peerId derivation, the exponential-backoff step, the 429
+        // Retry-After parse, and the jittered reconnect delay. None need a live WebSocket, so they run in
+        // a headless macOS CI job.
+        .testTarget(name: "HopBearerRelayTests", dependencies: ["HopBearerRelay"]),
     ]
 )
