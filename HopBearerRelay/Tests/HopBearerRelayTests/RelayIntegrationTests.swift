@@ -173,7 +173,7 @@ final class RelayIntegrationTests: XCTestCase {
 
         // 1) the real WebSocket upgrade completes -> didOpenWithProtocol -> linkUp(.dialer, stablePeerId).
         guard spinWait(until: { !sink.ups.isEmpty }) else {
-            throw XCTSkip("URLSession did not open a cleartext ws:// loopback socket (ATS?) — see report")
+            throw XCTSkip("URLSession did not open a cleartext ws:// loopback socket (ATS?) - see report")
         }
         XCTAssertEqual(sink.ups[0].1, .dialer, "we dialed out -> Noise initiator role")
         XCTAssertEqual(sink.ups[0].2, RelayBearer.stablePeerId(forURL: server.url), "the surfaced peerId is the stable derivation")
@@ -232,7 +232,7 @@ final class RelayIntegrationTests: XCTestCase {
         let sink = RecSink(); bearer.sink = sink
         bearer.start()
         guard spinWait(until: { !sink.ups.isEmpty }) else {
-            throw XCTSkip("URLSession did not open a cleartext ws:// loopback socket (ATS?) — see report")
+            throw XCTSkip("URLSession did not open a cleartext ws:// loopback socket (ATS?) - see report")
         }
         let linkId = sink.ups[0].0
         bearer.stop()
@@ -250,7 +250,7 @@ final class RelayIntegrationTests: XCTestCase {
         bearer.start()   // second start() must be ignored (already started)
         defer { bearer.stop() }
         guard spinWait(until: { !sink.ups.isEmpty }) else {
-            throw XCTSkip("URLSession did not open a cleartext ws:// loopback socket (ATS?) — see report")
+            throw XCTSkip("URLSession did not open a cleartext ws:// loopback socket (ATS?) - see report")
         }
         XCTAssertEqual(sink.ups.count, 1, "a redundant start() must not open a second link")
         bearer.send(Data([0x00]), on: 999)   // unknown link id -> ignored, no crash

@@ -2,7 +2,7 @@
 // real loopback TCP socket (NWListener + NWConnection on 127.0.0.1), bypassing Bonjour discovery via the
 // DEBUG test seams. Unlike the pure-logic tests, they exercise the LIVE code: the acceptor + dialer
 // `LanLink` (start / onReady / HELLO / receiveLoop / deframe / handle / sendFrame / ping / watchdog /
-// close) and the bearer's real onUp/onData/onClose bookkeeping incl. the one-pipe-per-peer dedup — the
+// close) and the bearer's real onUp/onData/onClose bookkeeping incl. the one-pipe-per-peer dedup - the
 // paths the old "shadow" model tests only re-implemented in the test file. No device, no radio, no mDNS.
 
 import XCTest
@@ -84,7 +84,7 @@ final class LanIntegrationTests: XCTestCase {
 
     private func randId() -> Data { Data((0..<16).map { _ in UInt8.random(in: .min ... .max) }) }
 
-    // MARK: acceptor side — a real LanBearer accepts a real loopback socket and runs the full link.
+    // MARK: acceptor side - a real LanBearer accepts a real loopback socket and runs the full link.
 
     func testAcceptorRealLinkUpBytesPingAndDown() {
         let myId = randId()
@@ -138,7 +138,7 @@ final class LanIntegrationTests: XCTestCase {
         XCTAssertTrue(spinWait { sink.downs.contains(linkId) }, "closing the socket must surface a linkDown")
     }
 
-    // MARK: dedup — two legs to the SAME peer exercise the real onUp one-pipe-per-peer survivor pick.
+    // MARK: dedup - two legs to the SAME peer exercise the real onUp one-pipe-per-peer survivor pick.
 
     func testAcceptorDedupKeepsOnePipePerPeer() {
         // myId chosen GREATER than the peer id so the keep-rule is "keep my dialer"; both inbound legs are
@@ -167,7 +167,7 @@ final class LanIntegrationTests: XCTestCase {
         peer1.cancel(); peer2.cancel()
     }
 
-    // MARK: dialer side — the real dial() path against a raw acceptor (no Bonjour needed).
+    // MARK: dialer side - the real dial() path against a raw acceptor (no Bonjour needed).
 
     func testDialerRealLinkOverLoopback() {
         // A raw NWListener that is NOT advertising _hoplan._tcp, so the bearer's browser can't discover it:
