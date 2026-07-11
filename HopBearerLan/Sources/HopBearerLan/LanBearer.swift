@@ -473,6 +473,38 @@ public final class LanBearer: Bearer {
     }
 }
 
+#if DEBUG
+// Test-only seams (DEBUG-only, so nothing ships in release). They live in this file because they touch
+// `private` members (the listener, lanQueue, the real dial()/restart paths). They add NO new behavior:
+// each just calls the real production path a device/Bonjour would otherwise trigger, so the integration
+// tests can drive linkUp/linkBytes/linkDown, the real dialer, and the restart backoff over loopback with
+// no radio and no mDNS.
+extension LanBearer {
+    /// The ephemeral port the listener bound to (nil until the NWListener reaches `.ready`). Lets a test
+    /// open a raw loopback NWConnection straight to the real acceptor, bypassing Bonjour discovery.
+    var testListenerPort: UInt16? { listener?.port?.rawValue }
+
+    /// Drive the REAL dialer path to a specific host:port, exactly as the browser callback does for a
+    /// discovered peer (self-check + one-in-flight dedup + dial()), but without needing an mDNS sighting.
+    func testDial(host: String, port: UInt16, peerId: Data) {
+        guard let p = NWEndpoint.Port(rawValue: port) else { return }
+        let ep = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: p)
+        lanQueue.async { [weak self] in
+            guard let self else { return }
+            guard lanShouldDial(myId: self.myId, peerId: peerId,
+                                alreadyLinked: self.linksByPeerId[peerId] != nil) else { return }
+            if !self.dialing.insert(hex(peerId)).inserted { return }
+            self.dial(ep, peerId)
+        }
+    }
+
+    /// Force the listener/browser rebuild-on-failure paths (F-11) that a Wi-Fi transition would otherwise
+    /// trigger, so the restart backoff is exercised without provoking a real transport failure.
+    func testForceRestartListener() { lanQueue.async { [weak self] in self?.restartListener() } }
+    func testForceRestartBrowser()  { lanQueue.async { [weak self] in self?.restartBrowser() } }
+}
+#endif
+
 /// The Bonjour instance name is the peer's 32-hex-char nodeId. Parse it back to 16 bytes. Internal
 /// (not private) so the pure-logic tests can exercise the hex round-trip without a live browser.
 func peerIdFromName(_ name: String) -> Data? {
