@@ -1,8 +1,9 @@
 // Unit tests for `gt`, the SPEC §1.2 unsigned big-endian tiebreaker primitive the dedup keep-rule is
-// built on. These drive the REAL `gt` function. The keep-rule ITSELF (which leg of a duplicate pair
-// survives) is no longer re-modeled here; it is covered end-to-end by BleBearerDedupTests, which drives
-// the production BleBearer.onUp dedup over this same `gt`. (Previously this file also carried a shadow
-// `keepDialed`/`newLegSurvives` re-implementation, removed, since it tested the test, not the bearer.)
+// built on (these drive the REAL `gt`), plus `bleNewLegSurvives`, the pure one-pipe-per-peer keep-rule
+// that `BleBearer.onUp` now CALLS (so this pins the exact production decision, not a copy). The keep-rule
+// is ALSO covered end-to-end by BleBearerDedupTests, which drives the production onUp dedup over these
+// same functions. (An earlier shadow `keepDialed`/`newLegSurvives` re-implementation was removed; this is
+// the real extracted function the bearer runs, mirroring the LAN bearer's `lanNewLegSurvives`.)
 
 import XCTest
 import Foundation
@@ -41,5 +42,32 @@ final class DedupTiebreakerTests: XCTestCase {
     func testGtEmptyVsNonEmpty() {
         XCTAssertTrue(gt(bytes([0x00]), bytes([])))   // longer (non-empty) wins the count tiebreak
         XCTAssertFalse(gt(bytes([]), bytes([0x00])))
+    }
+
+    // MARK: bleNewLegSurvives, the pure keep-rule BleBearer.onUp calls (mirrors lanNewLegSurvives).
+
+    private func nodeId(_ first: UInt8) -> Data { Data([first] + [UInt8](repeating: 0, count: 15)) }
+
+    func testSurvivorPickWhenIAmGreaterKeepsMyDialer() {
+        // I am greater (0x02 > 0x01) -> keep MY DIALED leg. A new dialer wins over an existing acceptor;
+        // a new acceptor loses to an existing dialer.
+        let me = nodeId(0x02); let peer = nodeId(0x01)
+        XCTAssertTrue(bleNewLegSurvives(myId: me, peer: peer, existingIsDialer: false, newIsDialer: true))
+        XCTAssertFalse(bleNewLegSurvives(myId: me, peer: peer, existingIsDialer: true, newIsDialer: false))
+    }
+
+    func testSurvivorPickWhenIAmLesserKeepsMyAcceptor() {
+        // I am lesser (0x01 < 0x02) -> keep MY ACCEPTOR leg. New acceptor wins over existing dialer;
+        // new dialer loses.
+        let me = nodeId(0x01); let peer = nodeId(0x02)
+        XCTAssertTrue(bleNewLegSurvives(myId: me, peer: peer, existingIsDialer: true, newIsDialer: false))
+        XCTAssertFalse(bleNewLegSurvives(myId: me, peer: peer, existingIsDialer: false, newIsDialer: true))
+    }
+
+    func testSurvivorPickDegenerateNoMatchFallsBackToNewLeg() {
+        // Both legs the same role (never a real dialer/acceptor pair): the `?? link` fallback keeps the
+        // new leg, matching onUp's original `[existing, link].first { ... } ?? link`.
+        let me = nodeId(0x02); let peer = nodeId(0x01)   // keepDialed == true
+        XCTAssertTrue(bleNewLegSurvives(myId: me, peer: peer, existingIsDialer: false, newIsDialer: false))
     }
 }

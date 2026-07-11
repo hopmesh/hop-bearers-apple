@@ -43,9 +43,10 @@ let L_DATA:  UInt8 = 0x10
 func lanKeepDialed(myId: Data, peer: Data) -> Bool { nodeIdGreater(myId, peer) }
 
 /// Given a duplicate pair (the already-registered `existingIsDialer` and the just-arrived `newIsDialer`)
-/// to `peer`, return true iff the NEW leg is the survivor. Mirror of onUp's survivor pick: keep the leg
-/// whose isDialer matches `lanKeepDialed`, falling back to the new leg if neither matches (defensive; in
-/// practice a real duplicate always has one dialer + one acceptor). Pure — no link objects, no I/O.
+/// to `peer`, return true iff the NEW leg is the survivor. This IS onUp's survivor pick (onUp calls it):
+/// keep the leg whose isDialer matches `lanKeepDialed`, falling back to the new leg if neither matches
+/// (defensive; in practice a real duplicate always has one dialer + one acceptor). Pure (no link objects,
+/// no I/O), so the unit test pins the exact production keep-rule, not a copy.
 func lanNewLegSurvives(myId: Data, peer: Data, existingIsDialer: Bool, newIsDialer: Bool) -> Bool {
     let keepDialed = lanKeepDialed(myId: myId, peer: peer)
     // The survivor is the first of [existing, new] whose isDialer == keepDialed, else the new leg.
@@ -444,14 +445,18 @@ public final class LanBearer: Bearer {
         // announced, and only the survivor carries wasSurfaced so only it can emit a linkDown later.
         linksByLinkId[link.linkId] = link           // register for send routing + linkDown pairing
         if let existing = linksByPeerId[peer], existing !== link {
-            let keepDialed = nodeIdGreater(myId, peer)      // keep MY dialed leg iff I'm the greater id
-            let keep = [existing, link].first { $0.isDialer == keepDialed } ?? link
-            let drop = (keep === link) ? existing : link
+            // Survivor pick via the pure, unit-tested keep-rule (this used to be re-inlined here, so the
+            // extracted `lanNewLegSurvives` was tested but never actually run in production). `newSurvives`
+            // == "the just-arrived leg wins": keep MY dialed leg iff I'm the greater id, so both ends agree.
+            let newSurvives = lanNewLegSurvives(myId: myId, peer: peer,
+                                                existingIsDialer: existing.isDialer, newIsDialer: link.isDialer)
+            let keep = newSurvives ? link : existing
+            let drop = newSurvives ? existing : link
             linksByPeerId[peer] = keep                      // set survivor BEFORE closing the dropped leg
-            if keep === link { link.wasSurfaced = true }    // only the survivor is announced (apple-12)
+            if newSurvives { link.wasSurfaced = true }      // only the survivor is announced (apple-12)
             drop.close("dedup")                             // loser was never surfaced -> no linkDown for it
             log("DEDUP", "lan kept isDialer=\(keep.isDialer) peer=\(shortHex(peer))")
-            if keep === link {                              // this leg is the survivor -> announce it now
+            if newSurvives {                                // this leg is the survivor -> announce it now
                 sink?.linkUp(link.linkId, role: link.isDialer ? .dialer : .acceptor, peerId: peer)
             }
             return

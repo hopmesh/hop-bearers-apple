@@ -190,6 +190,21 @@ func waitTimeoutDials(peerAlreadyDialedUs: Bool, weAreAlreadyDialing: Bool) -> B
     return true                               // fallback: dial so the link forms no matter what
 }
 
+// MARK: - Dedup survivor pick (pure + testable, mirrors HopBearerLan + Android BleDedup) -----------
+
+/// The one-pipe-per-peer keep-rule: given a duplicate pair to `peer` (the already-registered
+/// `existingIsDialer` and the just-arrived `newIsDialer`), return true iff the NEW leg is the survivor.
+/// Keep MY dialed leg iff I am the greater id (SPEC §2.3 `gt` tiebreaker), so two peers make OPPOSITE
+/// decisions and exactly one physical channel survives. Pure (no `DedupLink`, no I/O), and this IS the
+/// decision `BleBearer.onUp` runs (it calls this), so the unit test pins the production keep-rule, not a
+/// copy. Mirrors HopBearerLan's `lanNewLegSurvives` and Android's `BleDedup.decide`.
+func bleNewLegSurvives(myId: Data, peer: Data, existingIsDialer: Bool, newIsDialer: Bool) -> Bool {
+    let keepDialed = gt(myId, peer)                    // keep MY dialer iff I'm the greater id
+    if existingIsDialer == keepDialed { return false } // existing is the survivor
+    if newIsDialer == keepDialed { return true }       // new is the survivor
+    return true                                        // neither matched -> new leg (defensive; == onUp's ?? link)
+}
+
 // MARK: - DedupLink: the one-pipe-per-peer dedup seam ---------------------------------------------
 
 /// The slice of a live link the bearer's dedup/routing needs, with NO CoreBluetooth in it. `Link`
@@ -310,18 +325,21 @@ public final class BleBearer: Bearer {
         let existing = linksByPeerId[peer]
         var drop: DedupLink? = nil
         if let existing, existing !== link {        // SPEC §2.3 dedup
-            let keepDialed = gt(myId, peer)         // keep MY dialed channel iff I'm the greater id
-            let keep = [existing, link].first { $0.isDialer == keepDialed } ?? link
-            drop = (keep === link) ? existing : link
+            // Survivor pick via the pure, unit-tested keep-rule (was inlined here; now shared with the
+            // BleBearerDedupTests that drive this exact path). `newSurvives` == "the just-arrived leg wins".
+            let newSurvives = bleNewLegSurvives(myId: myId, peer: peer,
+                                                existingIsDialer: existing.isDialer, newIsDialer: link.isDialer)
+            let keep: DedupLink = newSurvives ? link : existing
+            drop = newSurvives ? existing : link
             linksByPeerId[peer] = keep              // SPEC R3: set survivor BEFORE closing the dropped channel
-            if keep === link { link.wasSurfaced = true }   // only the survivor is announced (apple-12)
+            if newSurvives { link.wasSurfaced = true }   // only the survivor is announced (apple-12)
             mapLock.unlock()
             if let drop {
                 log("DEDUP", "kept isDialer=\(keep.isDialer) peer=\(shortHex(peer))")
                 // Close the loser. It was never surfaced, so onClose emits no linkDown for it.
                 drop.close("dedup")
             }
-            if keep === link {                      // this leg is the survivor -> announce it now
+            if newSurvives {                        // this leg is the survivor -> announce it now
                 sink?.linkUp(link.linkId, role: link.isDialer ? .dialer : .acceptor, peerId: peer)
             }
             return
