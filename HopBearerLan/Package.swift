@@ -11,11 +11,11 @@ let package = Package(
         .library(name: "HopBearerLan", targets: ["HopBearerLan"]),
     ],
     dependencies: [
-        .package(path: "../../../sdk/wrappers/Hop"),
+        .package(path: "../../../sdk/wrappers/apple"),
     ],
     targets: [
         // the SDK package (dir "Hop") provides the "Hop" product.
-        .target(name: "HopBearerLan", dependencies: [.product(name: "HopContract", package: "Hop")]),
+        .target(name: "HopBearerLan", dependencies: [.product(name: "HopContract", package: "apple")]),
         // Pure-logic coverage (apple-07): the dedup tiebreaker / survivor pick, the wasSurfaced
         // link-lifecycle rule (apple-12), the length-prefix deframer, and the Bonjour-name hex parse.
         // None of these need a live NWConnection, so they run in a headless macOS CI job.

@@ -10,10 +10,10 @@ let package = Package(
         .library(name: "HopBearerRelay", targets: ["HopBearerRelay"]),
     ],
     dependencies: [
-        .package(path: "../../../sdk/wrappers/Hop"),
+        .package(path: "../../../sdk/wrappers/apple"),
     ],
     targets: [
-        .target(name: "HopBearerRelay", dependencies: [.product(name: "HopContract", package: "Hop")]),
+        .target(name: "HopBearerRelay", dependencies: [.product(name: "HopContract", package: "apple")]),
         // Pure-logic coverage: the stable peerId derivation, the exponential-backoff step, the 429
         // Retry-After parse, and the jittered reconnect delay. None need a live WebSocket, so they run in
         // a headless macOS CI job.

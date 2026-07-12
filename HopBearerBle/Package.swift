@@ -11,12 +11,12 @@ let package = Package(
         .library(name: "HopBearerBle", targets: ["HopBearerBle"]),
     ],
     dependencies: [
-        .package(path: "../../../sdk/wrappers/Hop"),
+        .package(path: "../../../sdk/wrappers/apple"),
     ],
     targets: [
-        .target(name: "HopBearerBle", dependencies: [.product(name: "HopContract", package: "Hop")]),
+        .target(name: "HopBearerBle", dependencies: [.product(name: "HopContract", package: "apple")]),
         // The tests drive the REAL bearer dedup through a fake DedupLink + a fake LinkSink, so the test
         // target needs HopContract to name LinkSink / HopRole (the sink the bearer surfaces links to).
-        .testTarget(name: "HopBearerBleTests", dependencies: ["HopBearerBle", .product(name: "HopContract", package: "Hop")]),
+        .testTarget(name: "HopBearerBleTests", dependencies: ["HopBearerBle", .product(name: "HopContract", package: "apple")]),
     ]
 )
