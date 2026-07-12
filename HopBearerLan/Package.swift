@@ -11,7 +11,7 @@ let package = Package(
         .library(name: "HopBearerLan", targets: ["HopBearerLan"]),
     ],
     dependencies: [
-        .package(path: "../../../sdk/wrappers/apple"),
+        .package(path: "../../../sdk/apple"),
     ],
     targets: [
         // the SDK package (dir "Hop") provides the "Hop" product.

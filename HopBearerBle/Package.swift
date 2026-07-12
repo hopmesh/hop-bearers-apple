@@ -11,7 +11,7 @@ let package = Package(
         .library(name: "HopBearerBle", targets: ["HopBearerBle"]),
     ],
     dependencies: [
-        .package(path: "../../../sdk/wrappers/apple"),
+        .package(path: "../../../sdk/apple"),
     ],
     targets: [
         .target(name: "HopBearerBle", dependencies: [.product(name: "HopContract", package: "apple")]),
