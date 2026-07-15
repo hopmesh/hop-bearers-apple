@@ -1,0 +1,51 @@
+# Cut a GitHub Release when a semver tag is pushed. These Swift bearer packages publish BY GIT TAG:
+# Swift Package Manager resolves a tagged commit directly, there is no registry and no token beyond the
+# built-in GITHUB_TOKEN. The tag itself IS the release. This mirror holds several packages
+# (HopBearerBle, HopBearerLan, HopBearerRelay); a consumer pins whichever it needs at the same tag:
+#
+#     .package(url: "https://github.com/hopmesh/hop-bearers-apple.git", from: "X.Y.Z")
+#
+# This file is carried in from the Hop monorepo subtree (bearers/apple) by Copybara, where it becomes
+# the repo-root release workflow of the hopmesh/hop-bearers-apple mirror. Edit it in the monorepo,
+# never here.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Describe each bearer package (light gate, no full build)
+        # A full `swift build` binds libhop (each bearer depends on the sibling sdk/apple package plus its
+        # Frameworks/libhop.xcframework, a gitignored artifact), which a bare mirror runner does not have,
+        # so it cannot gate the release. `swift package describe` parses each Package.swift and dumps the
+        # target graph, catching a broken manifest. It is best effort (resolving the graph may still reach
+        # for the sibling package and the missing xcframework), so it never blocks the release. The full
+        # build plus `swift test` runs in the monorepo CI where the xcframework is present.
+        continue-on-error: true
+        run: |
+          found=0
+          for manifest in */Package.swift; do
+            [ -f "$manifest" ] || continue
+            pkg="$(dirname "$manifest")"
+            found=1
+            echo "== describing $pkg =="
+            swift package describe --package-path "$pkg" \
+              || echo "describe of $pkg needs the sdk/apple sibling and the libhop xcframework (expected absent on a bare runner)"
+          done
+          [ "$found" -eq 1 ] || echo "no Package.swift found under any subpackage"
+
+      - name: Create the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
