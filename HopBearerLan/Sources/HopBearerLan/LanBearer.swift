@@ -25,12 +25,87 @@ private let LAN_DEAD_S: Double = 15.0     // TCP is reliable; a generous livenes
 private let LAN_REAP_S: Double = 5.0      // close a connection that never completes HELLO
 private let LAN_CONNECT_S: Double = 8.0   // F-11: give up a dial that never reaches .ready
 private let LAN_RESTART_S: Double = 2.0   // F-11: backoff before restarting a failed listener/browser
-private let LAN_MAX_FRAME = 4 * 1024 * 1024
+let LAN_MAX_FRAME = 1 << 20
+let LAN_MAX_PENDING_LINKS = 32
+let LAN_MAX_PREAUTH_BYTES_PER_LINK = LAN_MAX_FRAME + 4
+let LAN_MAX_PREAUTH_BYTES_TOTAL = 4 * LAN_MAX_PREAUTH_BYTES_PER_LINK
 
 let L_HELLO: UInt8 = 0x01
 let L_PING:  UInt8 = 0x02
 let L_PONG:  UInt8 = 0x03
 let L_DATA:  UInt8 = 0x10
+
+/// Process-wide preauthentication admission. This bearer cannot observe Noise completion, so every
+/// lease remains charged until link close and every partial-frame byte remains charged until consumed.
+final class LanAdmission {
+    final class Lease {
+        private let admission: LanAdmission
+        fileprivate let id = UUID()
+
+        fileprivate init(_ admission: LanAdmission) { self.admission = admission }
+        func reserve(_ bytes: Int) -> Bool { admission.reserve(self, bytes) }
+        func release(_ bytes: Int) { admission.release(self, bytes) }
+        func close() { admission.close(self) }
+        var retainedBytes: Int { admission.retained(self) }
+        deinit { close() }
+    }
+
+    private let maxLinks: Int
+    private let maxBytesPerLink: Int
+    private let maxBytesTotal: Int
+    private let lock = NSLock()
+    private var held = [UUID: Int]()
+    private var bytes = 0
+
+    init(maxLinks: Int = LAN_MAX_PENDING_LINKS,
+         maxBytesPerLink: Int = LAN_MAX_PREAUTH_BYTES_PER_LINK,
+         maxBytesTotal: Int = LAN_MAX_PREAUTH_BYTES_TOTAL) {
+        self.maxLinks = maxLinks
+        self.maxBytesPerLink = maxBytesPerLink
+        self.maxBytesTotal = maxBytesTotal
+    }
+
+    func tryAcquire() -> Lease? {
+        lock.lock(); defer { lock.unlock() }
+        guard held.count < maxLinks else { return nil }
+        let lease = Lease(self)
+        held[lease.id] = 0
+        return lease
+    }
+
+    private func reserve(_ lease: Lease, _ amount: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard amount >= 0, let current = held[lease.id],
+              current + amount <= maxBytesPerLink, bytes + amount <= maxBytesTotal else { return false }
+        held[lease.id] = current + amount
+        bytes += amount
+        return true
+    }
+
+    private func release(_ lease: Lease, _ amount: Int) {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = held[lease.id] else { return }
+        let released = min(max(amount, 0), current)
+        held[lease.id] = current - released
+        bytes -= released
+    }
+
+    private func close(_ lease: Lease) {
+        lock.lock(); defer { lock.unlock() }
+        guard let retained = held.removeValue(forKey: lease.id) else { return }
+        bytes -= retained
+    }
+
+    private func retained(_ lease: Lease) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return held[lease.id] ?? 0
+    }
+
+    var linkCount: Int { lock.lock(); defer { lock.unlock() }; return held.count }
+    var retainedBytes: Int { lock.lock(); defer { lock.unlock() }; return bytes }
+}
+
+let LAN_ADMISSION = LanAdmission()
 
 // MARK: - Pure dedup decision (apple-12, extracted so it is unit-testable without an NWConnection) -----
 
@@ -70,8 +145,10 @@ struct LanDeframer {
 
     /// Append `bytes`, then pop every complete frame body. Sets `overLimit` and stops if a length is out
     /// of range (the caller closes the link on that). Bodies are returned in arrival order.
-    mutating func feed(_ bytes: [UInt8], overLimit: inout Bool) -> [[UInt8]] {
+    mutating func feed(_ bytes: [UInt8], overLimit: inout Bool,
+                       maxBufferedBytes: Int = LAN_MAX_PREAUTH_BYTES_PER_LINK) -> [[UInt8]] {
         overLimit = false
+        guard bytes.count <= maxBufferedBytes - inBuf.count else { overLimit = true; return [] }
         inBuf.append(contentsOf: bytes)
         var out = [[UInt8]]()
         while inBuf.count >= 4 {
@@ -121,16 +198,16 @@ final class LanLink {
 
     private let conn: NWConnection
     private let queue: DispatchQueue
+    private let admission: LanAdmission.Lease
     private var deframer = LanDeframer()   // the pure length-prefix parser (unit-tested separately). It
                                            // buffers [UInt8], NOT Data: Data's Int subscript is not
                                            // 0-based after removeFirst (matches the BLE Link).
     private var lastRxMs = nowMs()
     private let openedMs = nowMs()
+    private var ready = false
+    private var lastPingMs = nowMs()
     private var txSeq: UInt64 = 0
     private var rxSeq: UInt64 = 0
-    private var ping: DispatchSourceTimer?
-    private var watchdog: DispatchSourceTimer?
-    private var connectDeadline: DispatchSourceTimer?   // F-11: armed at start(), fires if never .ready
     private var closed = false
     // Own ourselves from start() until close(): nothing else holds a strong ref until onUp inserts us
     // into the bearer's maps, and the NWConnection handlers capture us weakly — so without this the
@@ -144,10 +221,12 @@ final class LanLink {
     var peerShort: String { shortHex(peerId) }
 
     init(conn: NWConnection, linkId: LinkId, isDialer: Bool, myId: Data, queue: DispatchQueue,
+         admission: LanAdmission.Lease,
          onUp: @escaping (LanLink) -> Void, onData: @escaping (LanLink, Data) -> Void,
          onClose: @escaping (LanLink) -> Void) {
         self.conn = conn; self.linkId = linkId; self.isDialer = isDialer; self.myId = myId
-        self.queue = queue; self.onUp = onUp; self.onData = onData; self.onClose = onClose
+        self.queue = queue; self.admission = admission
+        self.onUp = onUp; self.onData = onData; self.onClose = onClose
     }
 
     func start() {
@@ -162,39 +241,27 @@ final class LanLink {
             }
         }
         selfRetain = self          // own our lifecycle until close() (see selfRetain decl)
-        // F-11: arm the connect deadline from start(), NOT onReady(). A dial stuck in .waiting
-        // (ECONNREFUSED / unreachable / a stale Bonjour record for a restarted peer) never reaches
-        // .ready, so the onReady-armed reaper never runs — the link would self-retain forever and
-        // pin the peer in the bearer's `dialing` set, permanently blacklisting it for the process.
-        let d = DispatchSource.makeTimerSource(queue: queue)
-        d.schedule(deadline: .now() + LAN_CONNECT_S)
-        d.setEventHandler { [weak self] in
-            guard let self, !self.up else { return }
-            self.close("connect timeout")
-        }
-        connectDeadline = d; d.resume()
         conn.start(queue: queue)
     }
 
     private func onReady() {
-        connectDeadline?.cancel(); connectDeadline = nil   // reached .ready; the liveness watchdog takes over
+        ready = true
         log("STATE", "lan channel-ready isDialer=\(isDialer)")
         // HELLO first: [0x01][16B nodeId][1B role][1B flags]
         var hello = Data([L_HELLO]); hello.append(myId); hello.append(isDialer ? 1 : 0); hello.append(0)
         sendFrame(hello)
         receiveLoop()
-        let p = DispatchSource.makeTimerSource(queue: queue)
-        p.schedule(deadline: .now() + LAN_PING_S, repeating: LAN_PING_S)
-        p.setEventHandler { [weak self] in self?.sendPing() }
-        let w = DispatchSource.makeTimerSource(queue: queue)
-        w.schedule(deadline: .now() + 1.0, repeating: 1.0)
-        w.setEventHandler { [weak self] in self?.tick() }
-        ping = p; watchdog = w; p.resume(); w.resume()
     }
 
-    private func tick() {
-        if !up && Double(nowMs() - openedMs) / 1000 > LAN_REAP_S { close("no-HELLO reap"); return }
-        if up && Double(nowMs() - lastRxMs) / 1000 > LAN_DEAD_S { close("liveness DEAD") }
+    func maintenance(_ now: UInt64) {
+        guard !closed else { return }
+        if !ready && Double(now - openedMs) / 1000 > LAN_CONNECT_S { close("connect timeout"); return }
+        if ready && !up && Double(now - openedMs) / 1000 > LAN_REAP_S { close("no-HELLO reap"); return }
+        if up && Double(now - lastRxMs) / 1000 > LAN_DEAD_S { close("liveness DEAD"); return }
+        if ready && Double(now - lastPingMs) / 1000 >= LAN_PING_S {
+            lastPingMs = now
+            sendPing()
+        }
     }
 
     private func sendPing() {
@@ -211,6 +278,7 @@ final class LanLink {
 
     private func sendFrame(_ body: Data) {
         guard !closed else { return }
+        guard body.count >= 1, body.count <= LAN_MAX_FRAME else { close("outbound len \(body.count)"); return }
         var len = UInt32(body.count).bigEndian
         var frame = Data(); withUnsafeBytes(of: &len) { frame.append(contentsOf: $0) }; frame.append(body)
         conn.send(content: frame, completion: .contentProcessed { [weak self] err in
@@ -223,7 +291,8 @@ final class LanLink {
             guard let self else { return }
             if let data, !data.isEmpty {
                 self.lastRxMs = nowMs()
-                self.deframe([UInt8](data))
+                guard self.admission.reserve(data.count) else { self.close("preauth byte budget"); return }
+                self.deframe([UInt8](data), admittedBytes: data.count)
             }
             if let error { self.close("recv \(error)"); return }
             if isComplete { self.close("recv EOF"); return }
@@ -231,9 +300,12 @@ final class LanLink {
         }
     }
 
-    private func deframe(_ bytes: [UInt8]) {
+    private func deframe(_ bytes: [UInt8], admittedBytes: Int) {
+        let before = deframer.bufferedCount
         var overLimit = false
         let frames = deframer.feed(bytes, overLimit: &overLimit)
+        let consumed = before + admittedBytes - deframer.bufferedCount
+        defer { admission.release(consumed) }
         for f in frames { handle(f) }
         if overLimit { close("bad len") }
     }
@@ -260,9 +332,9 @@ final class LanLink {
     func close(_ why: String) {
         guard !closed else { return }
         closed = true
-        ping?.cancel(); watchdog?.cancel(); connectDeadline?.cancel()
         conn.cancel()
         log("STATE", "lan link-down (\(why)) peer=\(peerShort) isDialer=\(isDialer)")
+        admission.close()
         onClose(self)
         selfRetain = nil           // release self — safe to dealloc now
     }
@@ -284,11 +356,13 @@ public final class LanBearer: Bearer {
     private var browser: NWBrowser?
     private var linksByPeerId = [Data: LanLink]()
     private var linksByLinkId = [LinkId: LanLink]()
+    private var allLinksByLinkId = [LinkId: LanLink]()
     private var dialing = Set<String>()         // peerId-hex currently being dialed (pre-HELLO dedup)
     private var nextLinkId: LinkId = 1
     private var stopped = false                 // F-11: gate restart-after-failure once stopped
     private var listenerRestartPending = false
     private var browserRestartPending = false
+    private var maintenanceTimer: DispatchSourceTimer?
 
     public init(myId: Data) { self.myId = myId }
 
@@ -297,19 +371,35 @@ public final class LanBearer: Bearer {
         lanQueue.async { [weak self] in
             guard let self else { return }
             self.stopped = false
+            self.startMaintenance()
             self.startListener()
             self.startBrowser()
         }
     }
 
     public func stop() {
-        lanQueue.async { [weak self] in
-            guard let self else { return }
+        // Retain self until queued teardown completes. Pending LanLinks self-retain, so a weak capture
+        // can otherwise deallocate the bearer first and strand every global admission lease.
+        lanQueue.async {
             self.stopped = true
+            self.maintenanceTimer?.cancel(); self.maintenanceTimer = nil
             self.listener?.cancel(); self.listener = nil
             self.browser?.cancel(); self.browser = nil
-            for l in self.linksByPeerId.values { l.close("stop") }
+            for l in Array(self.allLinksByLinkId.values) { l.close("stop") }
         }
+    }
+
+    private func startMaintenance() {
+        guard maintenanceTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: lanQueue)
+        timer.schedule(deadline: .now() + LAN_PING_S, repeating: LAN_PING_S)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let now = nowMs()
+            for link in Array(self.allLinksByLinkId.values) { link.maintenance(now) }
+        }
+        maintenanceTimer = timer
+        timer.resume()
     }
 
     // F-11: a failed listener/browser used to only log — after a Wi-Fi transition or sleep/wake the
@@ -343,6 +433,26 @@ public final class LanBearer: Bearer {
 
     private func mint() -> LinkId { let id = nextLinkId; nextLinkId += 1; return id }
 
+    @discardableResult
+    private func startLink(_ conn: NWConnection, isDialer: Bool,
+                           admission: LanAdmission.Lease? = LAN_ADMISSION.tryAcquire(),
+                           onClose: ((LanLink) -> Void)? = nil) -> Bool {
+        guard !stopped, let admission else {
+            admission?.close()
+            conn.cancel()
+            return false
+        }
+        let closeHandler: (LanLink) -> Void = onClose ?? { [weak self] link in self?.onClose(link) }
+        let link = LanLink(conn: conn, linkId: mint(), isDialer: isDialer, myId: myId, queue: lanQueue,
+                           admission: admission,
+                           onUp: { [weak self] in self?.onUp($0) },
+                           onData: { [weak self] in self?.onData($0, $1) },
+                           onClose: closeHandler)
+        allLinksByLinkId[link.linkId] = link
+        link.start()
+        return true
+    }
+
     // The Bonjour instance name IS our nodeId (hex), so a browser learns the peer id without connecting.
     private func startListener() {
         do {
@@ -351,11 +461,7 @@ public final class LanBearer: Bearer {
             l.newConnectionHandler = { [weak self] conn in
                 guard let self else { return }
                 log("STATE", "lan inbound-connection (acceptor)")
-                let link = LanLink(conn: conn, linkId: self.mint(), isDialer: false, myId: self.myId, queue: self.lanQueue,
-                                   onUp: { [weak self] in self?.onUp($0) },
-                                   onData: { [weak self] in self?.onData($0, $1) },
-                                   onClose: { [weak self] in self?.onClose($0) })
-                link.start()
+                self.startLink(conn, isDialer: false)
             }
             l.stateUpdateHandler = { [weak self] state in
                 if case .failed(let e) = state {
@@ -396,12 +502,15 @@ public final class LanBearer: Bearer {
     }
 
     private func dial(_ endpoint: NWEndpoint, _ peerId: Data) {
+        guard let admission = LAN_ADMISSION.tryAcquire() else {
+            dialing.remove(hex(peerId))
+            return
+        }
         let conn = NWConnection(to: endpoint, using: .tcp)
-        let link = LanLink(conn: conn, linkId: mint(), isDialer: true, myId: myId, queue: lanQueue,
-                           onUp: { [weak self] in self?.onUp($0) },
-                           onData: { [weak self] in self?.onData($0, $1) },
-                           onClose: { [weak self] l in self?.onDialClosed(l, peerId) })
-        link.start()
+        if !startLink(conn, isDialer: true, admission: admission,
+                      onClose: { [weak self] link in self?.onDialClosed(link, peerId) }) {
+            dialing.remove(hex(peerId))
+        }
     }
 
     // F-14: a dial that closes before ever coming up (connect timeout / refused) used to just drop
@@ -469,6 +578,7 @@ public final class LanBearer: Bearer {
     private func onData(_ link: LanLink, _ bytes: Data) { sink?.linkBytes(link.linkId, bytes) }
 
     private func onClose(_ link: LanLink) {
+        allLinksByLinkId.removeValue(forKey: link.linkId)
         let wasUp = linksByLinkId.removeValue(forKey: link.linkId) != nil        // true iff registered in onUp
         if let peer = link.peerId, linksByPeerId[peer] === link { linksByPeerId.removeValue(forKey: peer) }
         // apple-12: a deduped loser never reached sink.linkUp, so it must not emit a linkDown either.
@@ -488,6 +598,19 @@ extension LanBearer {
     /// The ephemeral port the listener bound to (nil until the NWListener reaches `.ready`). Lets a test
     /// open a raw loopback NWConnection straight to the real acceptor, bypassing Bonjour discovery.
     var testListenerPort: UInt16? { listener?.port?.rawValue }
+    var testPendingLinkCount: Int { LAN_ADMISSION.linkCount }
+    var testRetainedPreauthBytes: Int { LAN_ADMISSION.retainedBytes }
+
+    /// Start only the real listener and shared maintenance timer, without Bonjour browsing. This keeps
+    /// hostile acceptor tests isolated from stale services advertised by earlier integration cases.
+    func testStartListenerOnly() {
+        lanQueue.async { [weak self] in
+            guard let self else { return }
+            self.stopped = false
+            self.startMaintenance()
+            self.startListener()
+        }
+    }
 
     /// Drive the REAL dialer path to a specific host:port, exactly as the browser callback does for a
     /// discovered peer (self-check + one-in-flight dedup + dial()), but without needing an mDNS sighting.

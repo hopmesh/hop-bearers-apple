@@ -35,13 +35,20 @@ private final class RawPeer {
     private var deframer = LanDeframer()
     private let onReady: (RawPeer) -> Void
     private let onBody: ([UInt8]) -> Void
+    private let stateLock = NSLock()
+    private var _closed = false
 
     init(host: String, port: UInt16, onReady: @escaping (RawPeer) -> Void, onBody: @escaping ([UInt8]) -> Void) {
         conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
         self.onReady = onReady; self.onBody = onBody
     }
     func start() {
-        conn.stateUpdateHandler = { [weak self] st in guard let self else { return }; if case .ready = st { self.onReady(self) } }
+        conn.stateUpdateHandler = { [weak self] st in
+            guard let self else { return }
+            if case .ready = st { self.onReady(self) }
+            if case .failed = st { self.stateLock.withLock { self._closed = true } }
+            if case .cancelled = st { self.stateLock.withLock { self._closed = true } }
+        }
         conn.start(queue: q)
         recv()
     }
@@ -50,16 +57,24 @@ private final class RawPeer {
             guard let self else { return }
             if let data, !data.isEmpty { var over = false; for b in self.deframer.feed([UInt8](data), overLimit: &over) { self.onBody(b) } }
             if err == nil && !complete { self.recv() }
+            else { self.stateLock.withLock { self._closed = true } }
         }
     }
     func send(_ body: [UInt8]) { conn.send(content: Data(lanFrame(body)), completion: .contentProcessed { _ in }) }
+    func sendRaw(_ bytes: Data) { conn.send(content: bytes, completion: .contentProcessed { _ in }) }
     func cancel() { conn.cancel() }
+    var isClosed: Bool { stateLock.withLock { _closed } }
 }
 
 /// A HELLO frame body: [0x01][16B nodeId][1B role][1B flags].
 private func helloBody(_ id: Data, dialer: Bool) -> [UInt8] { [L_HELLO] + [UInt8](id) + [dialer ? 1 : 0, 0] }
 private func dataBody(_ payload: [UInt8]) -> [UInt8] { [L_DATA] + payload }
 private func pingBody() -> [UInt8] { [L_PING] + [UInt8](repeating: 0, count: 8) + [UInt8](repeating: 1, count: 8) }
+private func lengthPrefix(_ length: Int) -> Data {
+    let value = UInt32(length)
+    return Data([UInt8(value >> 24 & 0xff), UInt8(value >> 16 & 0xff),
+                 UInt8(value >> 8 & 0xff), UInt8(value & 0xff)])
+}
 
 /// Spin the calling thread (letting the bearer's background queues run) until `cond` holds or timeout.
 private func spinWait(_ timeout: TimeInterval = 6, until cond: () -> Bool) -> Bool {
@@ -90,7 +105,7 @@ final class LanIntegrationTests: XCTestCase {
         let myId = randId()
         let bearer = LanBearer(myId: myId)
         let sink = RecSink(); bearer.sink = sink
-        bearer.start()
+        bearer.testStartListenerOnly()
         defer { bearer.stop() }
 
         XCTAssertTrue(spinWait { bearer.testListenerPort != nil }, "the real NWListener must bind a port")
@@ -138,6 +153,122 @@ final class LanIntegrationTests: XCTestCase {
         XCTAssertTrue(spinWait { sink.downs.contains(linkId) }, "closing the socket must surface a linkDown")
     }
 
+    func testPendingSlowPeersStopAtCapAndCleanupAdmitsAValidPeer() {
+        XCTAssertTrue(spinWait { LAN_ADMISSION.linkCount == 0 })
+        let bearer = LanBearer(myId: randId())
+        let sink = RecSink(); bearer.sink = sink
+        bearer.testStartListenerOnly()
+        XCTAssertTrue(spinWait { bearer.testListenerPort != nil })
+        let port = bearer.testListenerPort!
+        var peers: [RawPeer] = []
+        defer {
+            peers.forEach { $0.cancel() }
+            bearer.stop()
+            _ = spinWait { LAN_ADMISSION.linkCount == 0 }
+        }
+
+        for _ in 0..<LAN_MAX_PENDING_LINKS {
+            let peer = RawPeer(host: "127.0.0.1", port: port, onReady: { _ in }, onBody: { _ in })
+            peers.append(peer); peer.start()
+        }
+        XCTAssertTrue(spinWait { bearer.testPendingLinkCount == LAN_MAX_PENDING_LINKS })
+
+        let overflow = RawPeer(host: "127.0.0.1", port: port, onReady: { _ in }, onBody: { _ in })
+        peers.append(overflow); overflow.start()
+        XCTAssertTrue(spinWait { overflow.isClosed }, "cap+1 connection is closed")
+        XCTAssertEqual(bearer.testPendingLinkCount, LAN_MAX_PENDING_LINKS)
+
+        peers[0].cancel()
+        XCTAssertTrue(spinWait { bearer.testPendingLinkCount == LAN_MAX_PENDING_LINKS - 1 })
+        let validId = randId()
+        let valid = RawPeer(host: "127.0.0.1", port: port,
+                            onReady: { $0.send(helloBody(validId, dialer: true)) }, onBody: { _ in })
+        peers.append(valid); valid.start()
+        XCTAssertTrue(spinWait { sink.ups.contains { $0.2 == validId } },
+                      "a valid peer links after hostile cleanup")
+    }
+
+    func testAggregatePreauthBytesRejectBeforeFifthAllocationAndRecover() {
+        XCTAssertTrue(spinWait { LAN_ADMISSION.linkCount == 0 })
+        let bearer = LanBearer(myId: randId())
+        let sink = RecSink(); bearer.sink = sink
+        bearer.testStartListenerOnly()
+        XCTAssertTrue(spinWait { bearer.testListenerPort != nil })
+        let port = bearer.testListenerPort!
+        var peers: [RawPeer] = []
+        defer {
+            peers.forEach { $0.cancel() }
+            bearer.stop()
+            _ = spinWait { LAN_ADMISSION.linkCount == 0 }
+        }
+
+        for _ in 0..<4 {
+            let partial: Data = {
+                var bytes = lengthPrefix(LAN_MAX_FRAME)
+                bytes.append(Data(repeating: 0x41, count: LAN_MAX_FRAME - 1))
+                return bytes
+            }()
+            let peer = RawPeer(host: "127.0.0.1", port: port,
+                               onReady: { $0.sendRaw(partial) }, onBody: { _ in })
+            peers.append(peer); peer.start()
+        }
+        XCTAssertTrue(spinWait { bearer.testRetainedPreauthBytes == 4 * (LAN_MAX_FRAME + 3) })
+
+        let overAggregate: Data = {
+            var bytes = lengthPrefix(LAN_MAX_FRAME)
+            bytes.append(0x42)
+            return bytes
+        }()
+        let rejected = RawPeer(host: "127.0.0.1", port: port,
+                               onReady: { $0.sendRaw(overAggregate) }, onBody: { _ in })
+        peers.append(rejected); rejected.start()
+        XCTAssertTrue(spinWait { rejected.isClosed },
+                      "aggregate exhaustion closes before allocating a fifth body")
+        XCTAssertEqual(bearer.testPendingLinkCount, 4)
+
+        peers.prefix(4).forEach { $0.cancel() }
+        XCTAssertTrue(spinWait { bearer.testRetainedPreauthBytes == 0 && bearer.testPendingLinkCount == 0 })
+        let validId = randId()
+        let valid = RawPeer(host: "127.0.0.1", port: port,
+                            onReady: { $0.send(helloBody(validId, dialer: true)) }, onBody: { _ in })
+        peers.append(valid); valid.start()
+        XCTAssertTrue(spinWait { sink.ups.contains { $0.2 == validId } })
+    }
+
+    func testOversizedAnnouncedFrameAndTimeoutReleaseForValidPeer() {
+        XCTAssertTrue(spinWait { LAN_ADMISSION.linkCount == 0 })
+        let bearer = LanBearer(myId: randId())
+        let sink = RecSink(); bearer.sink = sink
+        bearer.testStartListenerOnly()
+        XCTAssertTrue(spinWait { bearer.testListenerPort != nil })
+        let port = bearer.testListenerPort!
+        var peers: [RawPeer] = []
+        defer {
+            peers.forEach { $0.cancel() }
+            bearer.stop()
+            _ = spinWait { LAN_ADMISSION.linkCount == 0 }
+        }
+
+        let oversized = RawPeer(host: "127.0.0.1", port: port,
+                                onReady: { $0.sendRaw(lengthPrefix(LAN_MAX_FRAME + 1)) }, onBody: { _ in })
+        peers.append(oversized); oversized.start()
+        XCTAssertTrue(spinWait { oversized.isClosed })
+        XCTAssertTrue(spinWait { bearer.testPendingLinkCount == 0 })
+        XCTAssertEqual(bearer.testRetainedPreauthBytes, 0)
+
+        let stalled = RawPeer(host: "127.0.0.1", port: port, onReady: { _ in }, onBody: { _ in })
+        peers.append(stalled); stalled.start()
+        XCTAssertTrue(spinWait { bearer.testPendingLinkCount == 1 })
+        XCTAssertTrue(spinWait(7.0) { bearer.testPendingLinkCount == 0 },
+                      "the shared maintenance timer reaps a no-HELLO peer")
+
+        let validId = randId()
+        let valid = RawPeer(host: "127.0.0.1", port: port,
+                            onReady: { $0.send(helloBody(validId, dialer: true)) }, onBody: { _ in })
+        peers.append(valid); valid.start()
+        XCTAssertTrue(spinWait { sink.ups.contains { $0.2 == validId } })
+    }
+
     // MARK: dedup - two legs to the SAME peer exercise the real onUp one-pipe-per-peer survivor pick.
 
     func testAcceptorDedupKeepsOnePipePerPeer() {
@@ -148,7 +279,7 @@ final class LanIntegrationTests: XCTestCase {
         let peerId = Data(repeating: 0x01, count: 16)
         let bearer = LanBearer(myId: myId)
         let sink = RecSink(); bearer.sink = sink
-        bearer.start()
+        bearer.testStartListenerOnly()
         defer { bearer.stop() }
         XCTAssertTrue(spinWait { bearer.testListenerPort != nil })
         let port = bearer.testListenerPort!
@@ -197,7 +328,7 @@ final class LanIntegrationTests: XCTestCase {
 
         let bearer = LanBearer(myId: Data(repeating: 0xFF, count: 16))
         let sink = RecSink(); bearer.sink = sink
-        bearer.start()
+        bearer.testStartListenerOnly()
         defer { bearer.stop() }
 
         bearer.testDial(host: "127.0.0.1", port: port, peerId: listenerId)
@@ -225,7 +356,7 @@ final class LanIntegrationTests: XCTestCase {
     func testDialToDeadPortNeverSurfacesAndClearsDialing() {
         let bearer = LanBearer(myId: Data(repeating: 0xFF, count: 16))
         let sink = RecSink(); bearer.sink = sink
-        bearer.start()
+        bearer.testStartListenerOnly()
         defer { bearer.stop() }
         let dead = freeLoopbackPort()            // nothing is listening here -> ECONNREFUSED
         let peerId = Data(repeating: 0x02, count: 16)
@@ -242,7 +373,7 @@ final class LanIntegrationTests: XCTestCase {
     func testStopSurfacesLinkDownForLiveLink() {
         let bearer = LanBearer(myId: randId())
         let sink = RecSink(); bearer.sink = sink
-        bearer.start()
+        bearer.testStartListenerOnly()
         XCTAssertTrue(spinWait { bearer.testListenerPort != nil })
         let port = bearer.testListenerPort!
         let peer = RawPeer(host: "127.0.0.1", port: port, onReady: { $0.send(helloBody(self.randId(), dialer: true)) }, onBody: { _ in })

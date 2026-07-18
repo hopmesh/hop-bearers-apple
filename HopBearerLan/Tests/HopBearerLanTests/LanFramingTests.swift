@@ -69,7 +69,7 @@ final class LanFramingTests: XCTestCase {
 
     func testOversizedLengthIsFlaggedOverLimit() {
         var d = LanDeframer()
-        // A length prefix well past LAN_MAX_FRAME (4 MiB). 0x7FFFFFFF is ~2 GiB.
+        // A length prefix well past the protocol's 1 MiB LAN_MAX_FRAME. 0x7FFFFFFF is ~2 GiB.
         var over = false
         let out = d.feed([0x7F, 0xFF, 0xFF, 0xFF], overLimit: &over)
         XCTAssertTrue(over, "a length beyond LAN_MAX_FRAME must flag overLimit so the link closes")
@@ -98,12 +98,70 @@ final class LanFramingTests: XCTestCase {
     func testMaxSizedFrameIsAccepted() {
         var d = LanDeframer()
         // Exactly LAN_MAX_FRAME bytes of body must be accepted (boundary, not over).
-        let body = [UInt8](repeating: 0x5A, count: 4 * 1024 * 1024)
+        XCTAssertEqual(LAN_MAX_FRAME, 1 << 20)
+        let body = [UInt8](repeating: 0x5A, count: LAN_MAX_FRAME)
         var over = false
         let out = d.feed(lanFrame(body), overLimit: &over)
         XCTAssertFalse(over)
         XCTAssertEqual(out.count, 1)
         XCTAssertEqual(out.first?.count, body.count)
+    }
+
+    func testIncrementalBufferBudgetRejectsBeforeAppendGrowth() {
+        var d = LanDeframer()
+        var over = false
+        let prefix = Array(lanFrame([UInt8](repeating: 0, count: LAN_MAX_FRAME)).prefix(4))
+        XCTAssertEqual(d.feed(prefix, overLimit: &over), [])
+        XCTAssertFalse(over)
+        XCTAssertEqual(d.feed([UInt8](repeating: 0x41, count: LAN_MAX_FRAME - 1), overLimit: &over), [])
+        XCTAssertFalse(over)
+        let retained = d.bufferedCount
+        XCTAssertEqual(d.feed([0x42, 0x43], overLimit: &over), [])
+        XCTAssertTrue(over)
+        XCTAssertEqual(d.bufferedCount, retained, "rejected bytes never enter the deframer")
+    }
+
+    func testGlobalAdmissionCapsLinksAndAggregateBytes() {
+        let admission = LanAdmission(maxLinks: 3, maxBytesPerLink: 10, maxBytesTotal: 15)
+        let a = admission.tryAcquire()!
+        let b = admission.tryAcquire()!
+        let c = admission.tryAcquire()!
+        XCTAssertNil(admission.tryAcquire(), "cap+1 link is rejected")
+        XCTAssertTrue(a.reserve(10))
+        XCTAssertTrue(b.reserve(5))
+        XCTAssertFalse(c.reserve(1), "aggregate exhaustion rejects before allocation")
+        XCTAssertFalse(b.reserve(6), "per-link growth is bounded")
+        XCTAssertEqual(admission.retainedBytes, 15)
+
+        a.close(); a.close()
+        XCTAssertEqual(admission.retainedBytes, 5, "cleanup is idempotent")
+        XCTAssertTrue(c.reserve(10))
+        b.release(5); b.close(); c.close()
+        XCTAssertEqual(admission.linkCount, 0)
+        XCTAssertEqual(admission.retainedBytes, 0)
+    }
+
+    func testConcurrentSlowPeersStopExactlyAtGlobalCap() {
+        let admission = LanAdmission(maxLinks: LAN_MAX_PENDING_LINKS,
+                                     maxBytesPerLink: 1,
+                                     maxBytesTotal: LAN_MAX_PENDING_LINKS)
+        let lock = NSLock()
+        var leases: [LanAdmission.Lease] = []
+        let group = DispatchGroup()
+        for _ in 0..<(LAN_MAX_PENDING_LINKS * 2) {
+            group.enter()
+            DispatchQueue.global().async {
+                if let lease = admission.tryAcquire() {
+                    lock.lock(); leases.append(lease); lock.unlock()
+                }
+                group.leave()
+            }
+        }
+        group.wait()
+        XCTAssertEqual(leases.count, LAN_MAX_PENDING_LINKS)
+        XCTAssertEqual(admission.linkCount, LAN_MAX_PENDING_LINKS)
+        leases.forEach { $0.close() }
+        XCTAssertEqual(admission.linkCount, 0)
     }
 
     // MARK: Bonjour instance-name <-> nodeId hex parse (peerIdFromName).
