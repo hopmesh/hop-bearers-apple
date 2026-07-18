@@ -597,7 +597,12 @@ public final class LanBearer: Bearer {
 extension LanBearer {
     /// The ephemeral port the listener bound to (nil until the NWListener reaches `.ready`). Lets a test
     /// open a raw loopback NWConnection straight to the real acceptor, bypassing Bonjour discovery.
-    var testListenerPort: UInt16? { listener?.port?.rawValue }
+    var testListenerPort: UInt16? {
+        lanQueue.sync {
+            guard let listener, case .ready = listener.state else { return nil }
+            return listener.port?.rawValue
+        }
+    }
     var testPendingLinkCount: Int { LAN_ADMISSION.linkCount }
     var testRetainedPreauthBytes: Int { LAN_ADMISSION.retainedBytes }
 
