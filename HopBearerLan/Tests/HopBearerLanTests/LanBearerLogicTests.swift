@@ -14,7 +14,7 @@ final class LanBearerLogicTests: XCTestCase {
 
     private func bytes(_ vals: [UInt8]) -> Data { Data(vals) }
 
-    // MARK: dedup tiebreaker (apple-12) — the "greater id dials, keeps its dialer" keep-rule.
+    // MARK: dedup tiebreaker (apple-12), the "greater id dials, keeps its dialer" keep-rule.
 
     func testKeepDialedGreaterIdKeepsDialerLesserKeepsAcceptor() {
         let big = bytes([0x02]); let small = bytes([0x01])
@@ -37,7 +37,7 @@ final class LanBearerLogicTests: XCTestCase {
         XCTAssertNotEqual(lanKeepDialed(myId: a, peer: b), lanKeepDialed(myId: b, peer: a))
     }
 
-    // MARK: survivor pick — onUp's dedup selection lifted into lanNewLegSurvives.
+    // MARK: survivor pick, onUp's dedup selection lifted into lanNewLegSurvives.
 
     func testSurvivorPickWhenIAmGreaterKeepsMyDialer() {
         // I am greater -> I keep my DIALED leg. So a new dialer leg wins over an existing acceptor;

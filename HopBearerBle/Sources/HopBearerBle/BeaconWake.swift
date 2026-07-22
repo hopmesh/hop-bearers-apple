@@ -1,11 +1,11 @@
-// BeaconWake — the BLE bearer's OWN background-wake monitor (iOS).
+// BeaconWake, the BLE bearer's OWN background-wake monitor (iOS).
 //
 // An iBeacon region monitor: when a peer's iBeacon (emitted by a nearby Android, byte-matched UUID)
 // crosses our region boundary, iOS relaunches/wakes this app EVEN AFTER FORCE-QUIT and fires the
 // region callback, which pokes the BLE Central back into scanning so the L2CAP link re-forms
 // (BACKGROUND.md Layer C). This is the only background path that re-links a terminated app.
 //
-// This is BLE-transport machinery, so it lives in HopBearerBle — NOT in the app/facade and NOT in
+// This is BLE-transport machinery, so it lives in HopBearerBle, NOT in the app/facade and NOT in
 // hop-core (bearers are byte senders; the wake is just how the BLE radio gets a chance to re-link).
 // Owned and started by BleBearer; on a region enter / inside-determination it calls `onWake`, which
 // BleBearer routes straight to Central.wake().
@@ -17,10 +17,10 @@ import Foundation
 
 /// The iBeacon UUID THIS app monitors for background wake, and the SINGLE SOURCE OF TRUTH for the
 /// value across the shared bearer, the app drivers, and the Android emitter (F-40). It MUST byte-match
-/// what Android emits (bearer-ble BEACON_UUID) — a mismatch means iOS never sees the beacon and a
+/// what Android emits (bearer-ble BEACON_UUID), a mismatch means iOS never sees the beacon and a
 /// force-quit app never wakes (the historic F0900BEA-vs-7ED7BEAC silent bug). Kept OUTSIDE the
-/// `#if os(iOS)` guard (it's a plain UUID, platform-neutral) so macOS builds — e.g. the hopmac test
-/// tool — can reference it too instead of redefining the literal.
+/// `#if os(iOS)` guard (it's a plain UUID, platform-neutral) so macOS builds, e.g. the hopmac test
+/// tool, can reference it too instead of redefining the literal.
 public let BEACON_UUID = UUID(uuidString: "7ED7BEAC-3C2A-4F19-9B8E-1A2B3C4D5E6F")!
 
 #if os(iOS)
@@ -41,7 +41,7 @@ final class BeaconWake: NSObject, CLLocationManagerDelegate {
     }
 
     /// Request Always-authorization (needed for background region monitoring) and begin monitoring.
-    /// Idempotent — safe to call on every BleBearer.start() / cold-launch wake.
+    /// Idempotent, safe to call on every BleBearer.start() / cold-launch wake.
     func start() {
         location.requestAlwaysAuthorization()
         if location.authorizationStatus == .authorizedAlways {

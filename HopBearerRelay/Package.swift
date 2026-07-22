@@ -1,7 +1,7 @@
 // swift-tools-version:5.9
 import PackageDescription
 
-// HopBearerRelay — the cloud-relay transport (one outbound WebSocket, URLSession only) as a fully
+// HopBearerRelay, the cloud-relay transport (one outbound WebSocket, URLSession only) as a fully
 // INDEPENDENT package depending only on the Hop SDK.
 let package = Package(
     name: "HopBearerRelay",

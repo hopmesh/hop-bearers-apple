@@ -1,19 +1,19 @@
-// RelayBearer — the cloud-relay transport as its OWN library (depends only on HopBearerCore). It is the
+// RelayBearer, the cloud-relay transport as its OWN library (depends only on HopBearerCore). It is the
 // SIMPLEST bearer: ONE outbound WebSocket to the backbone relay, no peer discovery, no HELLO, no length
 // framing (a WS message already frames exactly one node packet), no keepalive/dedup. The relay's
 // lifecycle maps 1:1 to a single node link:
 //
-//   • start()  → dial the relay over a URLSessionWebSocketTask (Foundation only — NO third-party dep).
-//   • open     → sink.linkUp(linkId, .dialer, peerId) — we dialed, so we're the Noise initiator.
-//   • message  → sink.linkBytes(linkId, data) — one WS binary frame = one node packet.
+//   • start()  → dial the relay over a URLSessionWebSocketTask (Foundation only, NO third-party dep).
+//   • open     → sink.linkUp(linkId, .dialer, peerId): we dialed, so we're the Noise initiator.
+//   • message  → sink.linkBytes(linkId, data): one WS binary frame = one node packet.
 //   • close/err→ sink.linkDown(linkId) + reconnect with exponential backoff (the device "check-in").
 //   • send     → task.send(.data(bytes)).
 //   • stop()   → cancel the socket; the sink gets linkDown for the live link.
 //
 // The node identifies the relay via Noise over this link, so the consumer needs no real peer identity
-// from the transport — only a STABLE synthetic peerId for the BearerManager's bookkeeping. We derive it
+// from the transport, just a STABLE synthetic peerId for the BearerManager's bookkeeping. We derive it
 // deterministically from the relay URL (SHA-256 prefix) so it's identical every reconnect; the node
-// ignores it. This bearer names nothing about BLE/LAN — it is written purely against start/stop/send/sink.
+// ignores it. This bearer names nothing about BLE/LAN; it is written purely against start/stop/send/sink.
 
 import Foundation
 import CryptoKit
@@ -29,10 +29,10 @@ public final class RelayBearer: NSObject, Bearer {
     public let transportName = "Relay"
 
     private let relayURL: String
-    /// Stable synthetic peer id (16 bytes) for the manager's bookkeeping — derived from the relay URL so
+    /// Stable synthetic peer id (16 bytes) for the manager's bookkeeping, derived from the relay URL so
     /// it's identical every reconnect. The node ignores it (it identifies the relay via Noise).
     private let peerId: Data
-    /// ONE link — one WebSocket. The BearerManager translates this local id into its global id space, and
+    /// ONE link, one WebSocket. The BearerManager translates this local id into its global id space, and
     /// mints a fresh global on every reconnect (linkDown forgets the old mapping), so the node sees each
     /// reconnection as a new link, which is correct.
     private let linkId: LinkId = 1
@@ -158,7 +158,7 @@ extension RelayBearer: URLSessionWebSocketDelegate {
             log("STATE", "relay link-up peer=\(shortHex(self.peerId))")
             self.sink?.linkUp(self.linkId, role: .dialer, peerId: self.peerId)   // dialer = Noise initiator
             self.receiveLoop()
-            // F-13: reset backoff only after the link has been stable for a while, not on open — a
+            // F-13: reset backoff only after the link has been stable for a while, not on open, a
             // relay that accepts then immediately drops (overloaded / scale-capped) would otherwise be
             // re-dialed at the 1s floor forever.
             let work = DispatchWorkItem { [weak self] in

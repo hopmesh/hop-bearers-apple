@@ -1,6 +1,6 @@
-// LanBearer — the LAN transport as its OWN library (depends only on HopBearerCore). Two devices on the
+// LanBearer, the LAN transport as its OWN library (depends only on HopBearerCore). Two devices on the
 // same Wi-Fi/LAN discover each other over Bonjour (`_hoplan._tcp`) and talk over TCP. It is fully
-// self-contained: nothing here is shared with HopBearerBle (per "each bearer its own lib") — but it
+// self-contained: nothing here is shared with HopBearerBle (per "each bearer its own lib"), but it
 // speaks the SAME link grammar as the BLE bearer so the consumer sees identical linkUp/linkBytes/
 // linkDown semantics regardless of radio:
 //
@@ -11,7 +11,7 @@
 //     sink.linkBytes. One-pipe-per-peer dedup with the "greater nodeId dials" tiebreaker.
 //
 // Threading: one serial queue (`lanQueue`) owns the listener, browser, every NWConnection's callbacks,
-// and all link/dedup state + timers — so it is single-threaded end to end and needs no locks (the same
+// and all link/dedup state + timers, so it is single-threaded end to end and needs no locks (the same
 // discipline the BLE bearer gets from its single run loop).
 
 import Foundation
@@ -155,7 +155,7 @@ struct LanDeframer {
             let len = Int(inBuf[0]) << 24 | Int(inBuf[1]) << 16 | Int(inBuf[2]) << 8 | Int(inBuf[3])
             guard len >= 1, len <= LAN_MAX_FRAME else { overLimit = true; return out }
             let total = 4 + len
-            guard inBuf.count >= total else { break }   // partial frame — wait for more bytes
+            guard inBuf.count >= total else { break }   // partial frame, wait for more bytes
             out.append(Array(inBuf[4..<total]))
             inBuf.removeFirst(total)
         }
@@ -210,7 +210,7 @@ final class LanLink {
     private var rxSeq: UInt64 = 0
     private var closed = false
     // Own ourselves from start() until close(): nothing else holds a strong ref until onUp inserts us
-    // into the bearer's maps, and the NWConnection handlers capture us weakly — so without this the
+    // into the bearer's maps, and the NWConnection handlers capture us weakly, so without this the
     // link would dealloc the instant dial()/newConnectionHandler returns, before reaching .ready.
     private var selfRetain: LanLink?
 
@@ -336,7 +336,7 @@ final class LanLink {
         log("STATE", "lan link-down (\(why)) peer=\(peerShort) isDialer=\(isDialer)")
         admission.close()
         onClose(self)
-        selfRetain = nil           // release self — safe to dealloc now
+        selfRetain = nil           // release self, safe to dealloc now
     }
 
     private func appU64(_ d: inout Data, _ v: UInt64) { var be = v.bigEndian; withUnsafeBytes(of: &be) { d.append(contentsOf: $0) } }
@@ -402,7 +402,7 @@ public final class LanBearer: Bearer {
         timer.resume()
     }
 
-    // F-11: a failed listener/browser used to only log — after a Wi-Fi transition or sleep/wake the
+    // F-11: a failed listener/browser used to only log; after a Wi-Fi transition or sleep/wake the
     // device would silently stop accepting/discovering on LAN until the app relaunched. Rebuild each
     // on failure with a short backoff (unless we've been stopped).
     private func restartListener() {
@@ -465,7 +465,7 @@ public final class LanBearer: Bearer {
             }
             l.stateUpdateHandler = { [weak self] state in
                 if case .failed(let e) = state {
-                    log("STATE", "lan listener failed \(e) — restarting")
+                    log("STATE", "lan listener failed \(e), restarting")
                     self?.restartListener()
                 }
             }
@@ -493,7 +493,7 @@ public final class LanBearer: Bearer {
         }
         b.stateUpdateHandler = { [weak self] state in
             if case .failed(let e) = state {
-                log("STATE", "lan browser failed \(e) — restarting")
+                log("STATE", "lan browser failed \(e), restarting")
                 self?.restartBrowser()
             }
         }
@@ -514,7 +514,7 @@ public final class LanBearer: Bearer {
     }
 
     // F-14: a dial that closes before ever coming up (connect timeout / refused) used to just drop
-    // the peer from `dialing` and wait for mDNS to re-announce — which may not happen for a long time,
+    // the peer from `dialing` and wait for mDNS to re-announce, which may not happen for a long time,
     // silently forfeiting the high-bandwidth LAN path (with Wi-Fi Direct gone, LAN is the only Wi-Fi
     // transport for Android↔Android). Re-scan the current browse results shortly after so a transient
     // failure retries instead of stranding the peer. The greater-id tiebreaker means only we will dial.

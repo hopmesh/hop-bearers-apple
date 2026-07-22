@@ -15,7 +15,7 @@ import Foundation
 
 final class BackgroundLivenessTests: XCTestCase {
 
-    // MARK: (b) suspend-aware liveness — livenessVerdict
+    // MARK: (b) suspend-aware liveness, livenessVerdict
 
     /// A healthy, up link with recent RX and a normal ~1 s tick cadence is kept.
     func testHealthyUpLinkIsKept() {
@@ -30,7 +30,7 @@ final class BackgroundLivenessTests: XCTestCase {
     }
 
     /// THE apple-02(b) regression guard: an up link with a long RX gap BUT a large tick gap (the process
-    /// was suspended) must NOT be reaped — it gets suspend-grace instead. This is the exact frame where
+    /// was suspended) must NOT be reaped; it gets suspend-grace instead. This is the exact frame where
     /// the old code killed a live inbound path on wake.
     func testSuspendGapGrantsGraceNotReap() {
         // rxGap looks fatal on its own, but the tick gap proves we were asleep, not that the peer died.
@@ -39,28 +39,28 @@ final class BackgroundLivenessTests: XCTestCase {
     }
 
     /// A tick gap just under the suspend threshold is treated as a normal (awake) tick, so a normal RX
-    /// gap is still evaluated on its merits — here still alive.
+    /// gap is still evaluated on its merits, here still alive.
     func testTickGapJustUnderThresholdIsNormal() {
         let v = livenessVerdict(up: true, openedGapS: 40, rxGapS: 1.0, tickGapS: SUSPEND_GAP_S - 0.5, deadLimitS: DEAD_BG_S)
         XCTAssertEqual(v, .keep)
     }
 
     /// Suspend-grace also protects a half-open (not-yet-up) link across a suspend, rather than reaping it
-    /// as no-HELLO — the handshake may simply have been frozen with us.
+    /// as no-HELLO: the handshake may simply have been frozen with us.
     func testSuspendGraceProtectsHalfOpenLink() {
         let v = livenessVerdict(up: false, openedGapS: 30, rxGapS: 30, tickGapS: 20, deadLimitS: DEAD_FG_S)
         XCTAssertEqual(v, .suspendGrace)
     }
 
     /// A half-open link that never HELLOs, with a NORMAL tick cadence (we were awake the whole time), is
-    /// reaped once past REAP_S — suspend-grace must not mask a genuinely dead half-open link.
+    /// reaped once past REAP_S, suspend-grace must not mask a genuinely dead half-open link.
     func testHalfOpenNoHelloReapsWhenAwake() {
         let v = livenessVerdict(up: false, openedGapS: REAP_S + 1, rxGapS: REAP_S + 1, tickGapS: 1.0, deadLimitS: DEAD_FG_S)
         XCTAssertEqual(v, .reapNoHello)
     }
 
     /// After a suspend-grace tick reset the RX clock, the NEXT (awake) tick with continued silence
-    /// reaps — grace is one window, not an indefinite reprieve. Model the two-tick sequence:
+    /// reaps: grace is one window, not an indefinite reprieve. Model the two-tick sequence:
     ///   tick 1: big tick gap -> suspendGrace (caller resets rxGap to ~0)
     ///   tick 2: normal tick gap, but the peer is truly gone so rxGap climbs back past the deadline -> reap
     func testGraceIsSingleWindowThenReapsIfStillDead() {
@@ -71,9 +71,9 @@ final class BackgroundLivenessTests: XCTestCase {
         XCTAssertEqual(t2, .reapDead)
     }
 
-    // MARK: (c) "Android dials iOS" acceptor-bias — shouldDialNow
+    // MARK: (c) "Android dials iOS" acceptor-bias, shouldDialNow
 
-    /// Foreground, greater id: the plain SPEC §2.1 tiebreaker applies — we dial.
+    /// Foreground, greater id: the plain SPEC §2.1 tiebreaker applies, so we dial.
     func testForegroundGreaterIdDials() {
         XCTAssertTrue(shouldDialNow(appInBackground: false, haveKnownPrefix: true, tiebreakSaysDial: true))
     }
@@ -83,7 +83,7 @@ final class BackgroundLivenessTests: XCTestCase {
         XCTAssertFalse(shouldDialNow(appInBackground: false, haveKnownPrefix: true, tiebreakSaysDial: false))
     }
 
-    /// THE apple-02(c) core: backgrounded, even as the GREATER id we do NOT dial — we defer so the
+    /// THE apple-02(c) core: backgrounded, even as the GREATER id we do NOT dial; we defer so the
     /// Android peer dials our advertising acceptor. This is the "Android dials iOS" bias.
     func testBackgroundGreaterIdDefersToAcceptor() {
         XCTAssertFalse(shouldDialNow(appInBackground: true, haveKnownPrefix: true, tiebreakSaysDial: true))
@@ -104,7 +104,7 @@ final class BackgroundLivenessTests: XCTestCase {
 
     /// Symmetry / no-deadlock property: for a known distinct pair, at least one side dials. In the
     /// worst case (backgrounded iOS as greater id declines), the peer is the lesser id and would
-    /// normally wait — but the peer's wait-timeout fallback (WAIT_BASE_S) still dials, so the link forms.
+    /// normally wait, but the peer's wait-timeout fallback (WAIT_BASE_S) still dials, so the link forms.
     /// We assert the decision itself is well-defined (never both-nil): a foreground peer of either
     /// polarity produces a definite dialer.
     func testForegroundPairAlwaysHasADialer() {
@@ -155,7 +155,7 @@ final class BackgroundLivenessTests: XCTestCase {
         XCTAssertFalse(waitTimeoutDials(peerAlreadyDialedUs: true, weAreAlreadyDialing: true))
     }
 
-    // MARK: (a) background-task assertion — BackgroundAssertion lifecycle
+    // MARK: (a) background-task assertion, BackgroundAssertion lifecycle
 
     /// On macOS the assertion is a compiled no-op; the calls must be safe and non-crashing regardless of
     /// order (begin/renew/end/end). This guards the lifecycle surface the bearer drives.

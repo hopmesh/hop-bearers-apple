@@ -1,4 +1,4 @@
-// BackgroundAssertion — apple-02(a): a UIApplication.beginBackgroundTask assertion that keeps the
+// BackgroundAssertion, apple-02(a): a UIApplication.beginBackgroundTask assertion that keeps the
 // process alive for the OS grace window (~30 s) when it enters the background WHILE a BLE link is
 // live/servicing. Without it, iOS can suspend the process the instant the user backgrounds the app,
 // killing an in-flight L2CAP receive mid-frame (the socket read stops, the peer sees EOF, and the
@@ -6,7 +6,7 @@
 // finish and gives the acceptor/state-restoration path a chance to keep the pipe.
 //
 // This is transport machinery (it exists to protect an in-flight BLE receive), so it lives in the BLE
-// bearer next to the Link/watchdog it guards — NOT in the app. It is platform-abstracted so the macOS
+// bearer next to the Link/watchdog it guards, NOT in the app. It is platform-abstracted so the macOS
 // CLI/hopmac build (which cannot and need not take a UIKit assertion) compiles to a no-op.
 //
 // Concurrency: the public surface (begin/renew/end) is called only from the BLE bearer's executors
