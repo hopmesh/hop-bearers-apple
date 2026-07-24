@@ -155,6 +155,12 @@ final class LanIntegrationTests: XCTestCase {
 
     func testPendingSlowPeersStopAtCapAndCleanupAdmitsAValidPeer() {
         XCTAssertTrue(spinWait { LAN_ADMISSION.linkCount == 0 })
+        // The peers below deliberately never send HELLO, so the no-HELLO reaper (LAN_REAP_S, 5s) would
+        // cull them mid-test on a slow CI runner and drop testPendingLinkCount below the cap, flaking
+        // the exact-count assertions. Hold the reaper off for this test; production keeps the default.
+        let savedReapS = LAN_REAP_S
+        LAN_REAP_S = 3600
+        defer { LAN_REAP_S = savedReapS }
         let bearer = LanBearer(myId: randId())
         let sink = RecSink(); bearer.sink = sink
         bearer.testStartListenerOnly()

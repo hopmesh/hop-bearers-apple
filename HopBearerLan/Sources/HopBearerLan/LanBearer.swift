@@ -22,7 +22,7 @@ let LAN_SERVICE_TYPE = "_hoplan._tcp"
 
 private let LAN_PING_S: Double = 1.0
 private let LAN_DEAD_S: Double = 15.0     // TCP is reliable; a generous liveness deadline
-private let LAN_REAP_S: Double = 5.0      // close a connection that never completes HELLO
+var LAN_REAP_S: Double = 5.0              // close a connection that never completes HELLO (test seam: raised so a slow CI runner does not reap pending peers mid-test)
 private let LAN_CONNECT_S: Double = 8.0   // F-11: give up a dial that never reaches .ready
 private let LAN_RESTART_S: Double = 2.0   // F-11: backoff before restarting a failed listener/browser
 let LAN_MAX_FRAME = 1 << 20
