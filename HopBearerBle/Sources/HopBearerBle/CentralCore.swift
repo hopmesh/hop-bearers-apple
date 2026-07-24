@@ -50,6 +50,14 @@ final class CentralCore {
     private(set) var pendingWaits = Set<UUID>()          // SPEC R4: one outstanding wait per peer
     private(set) var advPrefixById = [UUID: Data]()      // backoff-key source (prefix once known)
     private(set) var backoff = [String: Double]()        // SPEC R2: key = 6B-prefix hex (stable), else identifier
+    // CONSECUTIVE failed dials per backoff key. The schedule is a function of this count, NOT of the
+    // time remaining on the previous deadline: a dial takes DIAL_TIMEOUT_S (12 s) to fail, which always
+    // outlasts a sub-2 s window, so a delta-based schedule found its deadline already lapsed and reset
+    // to the floor on every cycle. A peer that GATT-connects but never yields an L2CAP channel (a
+    // rotated MAC, a non-Hop advertiser) then re-dialed every ~13 s forever, monopolizing a dial slot
+    // and starving healthy peers. Android hit this and fixed it in DialBackoff.kt; Apple carried the
+    // original delta-based schedule until now. Both sides are pinned by ble-backoff-vectors.json.
+    private(set) var failCount = [String: Int]()
 
     init(myId: Data,
          now: @escaping () -> Double = { nowS() },
@@ -129,14 +137,16 @@ final class CentralCore {
     /// didFailToConnect / didDisconnect both reconnect (SPEC §6 backoff schedule).
     func disconnected(_ id: UUID) -> [CentralEffect] { reconnect(id) }
 
-    /// SPEC §6: release the peer, then set the next backoff deadline from the current one (doubling, capped
-    /// at 30 s, plus jitter) and evict expired backoff keys (SPEC R2 TTL). Mirrors `reconnect` byte-for-byte.
+    /// SPEC §6: release the peer, then set the next backoff deadline from the CONSECUTIVE failure count
+    /// (2 s, 4 s, 8 s, 16 s, 30 s cap, then a ~2 min quarantine past BACKOFF_QUARANTINE_AFTER), plus
+    /// jitter, and evict expired backoff keys (SPEC R2 TTL). Shares the schedule with Android's
+    /// `nextBackoffMs`; both are pinned by `bearers/ble-backoff-vectors.json`.
     private func reconnect(_ id: UUID) -> [CentralEffect] {
         retained.remove(id)
         let key = advPrefixById[id].map(hex) ?? id.uuidString
-        let base = backoff[key].map { max($0 - now(), 0.5) } ?? 0.5
-        let next = min(base * 2, 30) + jitter()
-        backoff[key] = now() + next
+        let n = (failCount[key] ?? 0) + 1
+        failCount[key] = n
+        backoff[key] = now() + bleNextBackoffS(failCount: n, jitter: jitter())
         evictBackoff()
         return [.cancelDialTimeout(id)]   // clearDialTimer(p)
     }
@@ -145,6 +155,9 @@ final class CentralCore {
     private func evictBackoff() {
         let cut = now() - LOST_S
         backoff = backoff.filter { $0.value > cut }
+        // Drop the paired counter too. Leaving it would keep a long-gone peer permanently
+        // quarantined the instant it reappears, and would leak an unbounded map.
+        failCount = failCount.filter { backoff[$0.key] != nil }
     }
 
     // MARK: PSM read + channel open (didUpdateValueFor / didOpen)
@@ -165,7 +178,9 @@ final class CentralCore {
     /// itself is constructed by the shell (it owns the CBL2CAPChannel); nothing here touches `retained`
     /// because the peer stays retained for the life of the link.
     func channelOpened(_ id: UUID) -> [CentralEffect] {
-        backoff[advPrefixById[id].map(hex) ?? id.uuidString] = nil
+        let key = advPrefixById[id].map(hex) ?? id.uuidString
+        backoff[key] = nil
+        failCount[key] = nil          // a peer that answered is healthy again, whatever its history
         return [.cancelDialTimeout(id)]
     }
 
@@ -176,7 +191,11 @@ final class CentralCore {
     /// was long-lived (SPEC §6), and cancel the connection so didDisconnect -> reconnect re-arms the dial.
     /// Does NOT release `retained` (the following didDisconnect's reconnect does).
     func dialerLinkClosed(_ id: UUID, stableUp: Bool) -> [CentralEffect] {
-        if stableUp { backoff[advPrefixById[id].map(hex) ?? id.uuidString] = nil }
+        if stableUp {
+            let key = advPrefixById[id].map(hex) ?? id.uuidString
+            backoff[key] = nil
+            failCount[key] = nil      // a link that stayed up >= STABLE_UP_MS proves the peer is real
+        }
         return retained.contains(id) ? [.cancelConnection(id)] : []
     }
 

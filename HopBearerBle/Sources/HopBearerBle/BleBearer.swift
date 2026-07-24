@@ -44,6 +44,30 @@ let MAX_FRAME = 4 * 1024 * 1024
 let STABLE_UP_MS: UInt64 = 30_000
 let LOST_S: Double = 30.0
 
+// MARK: - Dial backoff schedule (shared with Android's DialBackoff.kt)
+//
+// Pinned by `bearers/ble-backoff-vectors.json` and checked in CI by
+// `tools/ble-backoff-parity.sh`, because this schedule previously DIVERGED: Android moved to
+// count-based growth after a delta-based schedule was found resetting to the floor every cycle
+// (a dial takes DIAL_TIMEOUT_S to fail, which outlasts a sub-2 s window), and Apple kept the
+// broken version. Same numbers on both platforms or CI goes red.
+
+let BACKOFF_BASE_S: Double = 2.0
+let BACKOFF_MAX_S: Double = 30.0            // normal cap
+let BACKOFF_QUARANTINE_AFTER: Int = 6       // consecutive failures before the long cap applies
+let BACKOFF_QUARANTINE_S: Double = 120.0    // a chronically-failing target is clearly not a reachable peer
+
+/// Pure, deterministic backoff for the Nth CONSECUTIVE failed dial to one target (N >= 1), plus a
+/// caller-supplied jitter. Exponential in N so growth cannot be defeated by a dial timeout that
+/// outlasts the previous window: 2 s, 4 s, 8 s, 16 s, 30 s (cap), then a ~2 min quarantine.
+func bleNextBackoffS(failCount: Int, jitter: Double) -> Double {
+    let n = max(failCount, 1)
+    // Guard the shift; 2 s << 20 already dwarfs any cap.
+    let exp = BACKOFF_BASE_S * pow(2.0, Double(min(max(n - 1, 0), 20)))
+    let cap = n >= BACKOFF_QUARANTINE_AFTER ? BACKOFF_QUARANTINE_S : BACKOFF_MAX_S
+    return min(exp, cap) + jitter
+}
+
 // apple-02(b): suspend-aware liveness. The watchdog is a 1 Hz RunLoop timer; while iOS suspends the
 // process, no timers fire and wall-clock keeps advancing, so on wake `nowMs() - lastRxMs` looks like a
 // long RX silence and the link would be reaped as "liveness DEAD" even though the peer is fine, we

@@ -139,8 +139,11 @@ final class CentralCoreTests: XCTestCase {
         _ = c.discovered(idA, advPrefix: lesserPrefix)    // dialed; advPrefixById[idA]=lesserPrefix
         XCTAssertEqual(c.dialTimeoutFired(idA), [.cancelConnection(idA), .cancelDialTimeout(idA)])
         XCTAssertFalse(c.retained.contains(idA))
-        // First backoff: base 0.5 -> min(1.0, 30) + 0 jitter -> deadline = now + 1.0
-        XCTAssertEqual(c.backoff[hex(lesserPrefix)] ?? .nan, 1001.0, accuracy: 0.0001)
+        // First CONSECUTIVE failure -> 2.0s + 0 jitter -> deadline = now + 2.0.
+        // (Was 1.0s under the old delta-based schedule, which reset to its 0.5s floor every cycle
+        // because a 12s dial timeout always outlasts the previous window. See BackoffScheduleTests.)
+        XCTAssertEqual(c.backoff[hex(lesserPrefix)] ?? .nan, 1002.0, accuracy: 0.0001)
+        XCTAssertEqual(c.failCount[hex(lesserPrefix)], 1)
     }
 
     func testDialTimeoutNoOpWhenNotRetained() {
@@ -151,30 +154,67 @@ final class CentralCoreTests: XCTestCase {
     func testBackoffScheduleDoublesOnRepeatedReconnect() {
         let c = makeCore(myId: myId)
         _ = c.discovered(idA, advPrefix: lesserPrefix)
-        _ = c.dialTimeoutFired(idA)                       // backoff -> 1001 (base 0.5 -> next 1.0)
-        XCTAssertEqual(c.backoff[hex(lesserPrefix)] ?? .nan, 1001.0, accuracy: 0.0001)
-        // Next reconnect while the deadline is still ahead: base = max(1001-1000, 0.5) = 1.0 -> next 2.0
-        XCTAssertEqual(c.disconnected(idA), [.cancelDialTimeout(idA)])
+        _ = c.dialTimeoutFired(idA)                       // failure 1 -> 2.0s
         XCTAssertEqual(c.backoff[hex(lesserPrefix)] ?? .nan, 1002.0, accuracy: 0.0001)
+        XCTAssertEqual(c.disconnected(idA), [.cancelDialTimeout(idA)])  // failure 2 -> 4.0s
+        XCTAssertEqual(c.backoff[hex(lesserPrefix)] ?? .nan, 1004.0, accuracy: 0.0001)
+        XCTAssertEqual(c.failCount[hex(lesserPrefix)], 2)
+    }
+
+    /// The actual regression. Growth must key on the CONSECUTIVE FAILURE COUNT, not on time
+    /// remaining. Advancing the clock past each deadline (exactly what a 12s dial timeout does)
+    /// used to collapse the schedule back to ~1s forever; now it keeps climbing into quarantine.
+    func testBackoffGrowsEvenWhenEachDeadlineHasAlreadyLapsed() {
+        let c = makeCore(myId: myId)
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
+        let key = hex(lesserPrefix)
+        var previous = 0.0
+        for failure in 1...8 {
+            _ = c.disconnected(idA)
+            let delay = (c.backoff[key] ?? .nan) - clock
+            XCTAssertGreaterThanOrEqual(
+                delay, previous,
+                "failure \(failure): backoff must not shrink when the prior deadline has lapsed"
+            )
+            previous = delay
+            // Simulate the dial timeout outlasting the window we just set.
+            clock = (c.backoff[key] ?? clock) + Double(DIAL_TIMEOUT_S)
+        }
+        XCTAssertEqual(previous, BACKOFF_QUARANTINE_S, accuracy: 0.0001,
+                       "a chronically failing target ends up quarantined, not re-dialed every ~13s")
+    }
+
+    /// A peer that finally answers is healthy again, so both the deadline and the count clear.
+    func testSuccessResetsTheFailureCount() {
+        let c = makeCore(myId: myId)
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
+        _ = c.disconnected(idA)
+        _ = c.disconnected(idA)
+        XCTAssertEqual(c.failCount[hex(lesserPrefix)], 2)
+        _ = c.channelOpened(idA)
+        XCTAssertNil(c.failCount[hex(lesserPrefix)], "an answered dial clears the history")
+        XCTAssertNil(c.backoff[hex(lesserPrefix)])
     }
 
     func testBackoffRateLimitsRediscovery() {
         let c = makeCore(myId: myId)
         _ = c.discovered(idA, advPrefix: lesserPrefix)
-        _ = c.dialTimeoutFired(idA)                       // backoff deadline = 1001, now = 1000
+        _ = c.dialTimeoutFired(idA)                       // backoff deadline = 1002, now = 1000
         XCTAssertEqual(c.discovered(idA, advPrefix: lesserPrefix), [], "still inside the backoff window")
-        clock = 1002                                      // past the deadline
+        clock = 1003                                      // past the deadline
         XCTAssertEqual(c.discovered(idA, advPrefix: lesserPrefix), [.connect(idA), .armDialTimeout(idA)])
     }
 
     func testEvictBackoffDropsExpiredKeys() {
         let c = makeCore(myId: myId)
         _ = c.discovered(idA, advPrefix: lesserPrefix)
-        _ = c.dialTimeoutFired(idA)                       // backoff[hex(lesserPrefix)] = 1001
+        _ = c.dialTimeoutFired(idA)                       // backoff[hex(lesserPrefix)] = 1002
         clock = 1000 + LOST_S + 10                        // 1040: past LOST_S for the first key
         _ = c.disconnected(idB)                           // reconnect(idB) runs evictBackoff (cut = 1010)
-        XCTAssertNil(c.backoff[hex(lesserPrefix)], "the stale key (1001) is evicted")
+        XCTAssertNil(c.backoff[hex(lesserPrefix)], "the stale key (1002) is evicted")
         XCTAssertNotNil(c.backoff[idB.uuidString], "the fresh key survives")
+        XCTAssertNil(c.failCount[hex(lesserPrefix)],
+                     "the paired counter goes with it, or a long-gone peer returns pre-quarantined")
     }
 
     // MARK: PSM read + channel open
