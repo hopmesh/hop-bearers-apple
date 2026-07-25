@@ -14,6 +14,7 @@ git-cliff. Do not edit by hand.
 - finish the monorepo layout, kill platform stubs, unify the platform axis (O-1/O-3/O-4/O-5) (#115) (b56bb49)
 
 ### Documentation
+- regenerate from conventional commits (a355901)
 - branded, marketable READMEs for every sub-repo (9c2a477)
 
 ### Features
@@ -21,6 +22,10 @@ git-cliff. Do not edit by hand.
 - auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 
 ### Other
+- cut the frame cap to the protocol's, and pin it (2a16945)
+- Apple was resetting the dial backoff at the wrong moment (f94599f)
+- wire the relay pool end to end, and stop the wire guard false-firing (35946e0)
+- fix Apple's dial backoff and pin the schedule across platforms (54f6f02)
 - de-flake the LAN pending-cap test (hold the no-HELLO reaper) (8497488)
 - CLA gate on contributions (preserve commercial relicensing of core) (5a9aa7d)
 - SECURITY.md per component + enable-security in the bootstrap script (a1492e9)
