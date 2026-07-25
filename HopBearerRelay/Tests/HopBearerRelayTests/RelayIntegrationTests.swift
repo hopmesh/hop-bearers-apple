@@ -202,6 +202,77 @@ final class RelayIntegrationTests: XCTestCase {
         XCTAssertTrue(spinWait(4) { server.connectCount >= 2 }, "the bearer reconnects after a drop (backoff)")
     }
 
+    // MARK: pooled construction: the URL is resolved PER ATTEMPT, so failover needs no re-register.
+
+    func testPooledBearerResolvesPerAttemptAndReportsOutcomes() throws {
+        // The failover mechanism. A fixed URL meant a dead relay was retried forever and the only
+        // way to move was an app restart, because the shared BearerManager has no live re-register.
+        // Resolving per attempt lets the host hand back a healthier endpoint on the next dial.
+        let dead = WSTestServer(); dead.mode = .reject429(retryAfter: nil); dead.start()
+        let live = WSTestServer(); live.start()
+        defer { dead.stop(); live.stop() }
+        XCTAssertGreaterThan(live.port, 0)
+
+        let lock = NSLock()
+        var outcomes: [(String, Bool)] = []
+        var handOutLive = false
+        let deadURL = dead.url, liveURL = live.url
+
+        let bearer = RelayBearer(
+            seedURL: deadURL,
+            resolveURL: { lock.withLock { handOutLive ? liveURL : deadURL } },
+            reportOutcome: { url, ok in lock.withLock { outcomes.append((url, ok)) } }
+        )
+        let sink = RecSink(); bearer.sink = sink
+        bearer.start()
+        defer { bearer.stop() }
+
+        // The first attempt hits the dead relay and must be reported as a FAILURE, attributed to
+        // that URL specifically (not to whatever the pool would return later).
+        XCTAssertTrue(
+            spinWait(4) { lock.withLock { outcomes.contains { $0.0 == deadURL && !$0.1 } } },
+            "a failed dial is reported against the endpoint that failed"
+        )
+
+        // Now the pool hands back a healthy endpoint; the next attempt must use it WITHOUT any
+        // re-registration, and report success.
+        lock.withLock { handOutLive = true }
+        guard spinWait(8, until: { !sink.ups.isEmpty }) else {
+            throw XCTSkip("URLSession did not open a cleartext ws:// loopback socket (ATS?)")
+        }
+        XCTAssertTrue(
+            spinWait(4) { lock.withLock { outcomes.contains { $0.0 == liveURL && $0.1 } } },
+            "the next attempt failed over to the healthy endpoint and reported success"
+        )
+        // The synthetic peer id must NOT change across failover: the manager keys bookkeeping on it.
+        XCTAssertEqual(
+            sink.ups[0].2,
+            RelayBearer.stablePeerId(forURL: deadURL),
+            "the peer id stays seeded, so failover does not churn manager bookkeeping"
+        )
+    }
+
+    func testPooledBearerWithNothingDialableWaitsInsteadOfStopping() {
+        // Every pooled endpoint backed off is a WAIT state. If the bearer treated it as a stop, a
+        // transient outage would end reach permanently until restart.
+        let lock = NSLock()
+        var asked = 0
+        let bearer = RelayBearer(
+            seedURL: "ws://127.0.0.1:1/",
+            resolveURL: { lock.withLock { asked += 1 }; return nil },
+            reportOutcome: { _, _ in }
+        )
+        let sink = RecSink(); bearer.sink = sink
+        bearer.start()
+        defer { bearer.stop() }
+
+        XCTAssertTrue(
+            spinWait(6) { lock.withLock { asked >= 2 } },
+            "with nothing dialable the bearer must keep asking, not give up"
+        )
+        XCTAssertTrue(sink.ups.isEmpty, "it must not fabricate a link when there is nowhere to dial")
+    }
+
     // MARK: 429 rate-limit: the upgrade is rejected, didCompleteWithError carries the 429, backoff honors it.
 
     func test429RejectionHonorsRetryAfterBackoff() {

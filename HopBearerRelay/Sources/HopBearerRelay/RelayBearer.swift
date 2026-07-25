@@ -28,10 +28,24 @@ public final class RelayBearer: NSObject, Bearer {
     /// Short transport tag for the consumer's UI (Bearer contract). The cloud relay link surfaces as "Relay".
     public let transportName = "Relay"
 
-    private let relayURL: String
-    /// Stable synthetic peer id (16 bytes) for the manager's bookkeeping, derived from the relay URL so
-    /// it's identical every reconnect. The node ignores it (it identifies the relay via Noise).
-    private let peerId: Data
+    /// Where to dial, resolved PER ATTEMPT rather than fixed at construction.
+    ///
+    /// This is what makes relay failover possible without a live re-register on the shared
+    /// `BearerManager` (which has none). A fixed URL meant a dead relay was retried forever and the
+    /// only way to move was an app restart; asking each attempt lets the host hand back a different,
+    /// healthier endpoint from the node's §19 relay pool. Returning nil or an empty string means
+    /// "nothing dialable right now", which is a WAIT (retry on the next backoff tick), not a stop.
+    private let resolveURL: () -> String?
+    /// Reports the outcome of each attempt back to the host so the pool can score endpoints.
+    /// `(url, ok)`. No-op by default so a fixed-URL caller behaves exactly as before.
+    private let reportOutcome: (String, Bool) -> Void
+    /// The URL the CURRENT attempt used, so an outcome is attributed to the endpoint that earned it
+    /// rather than to whatever the pool would hand out now.
+    private var currentURL: String?
+    /// Stable synthetic peer id (16 bytes) for the manager's bookkeeping. Derived from the FIRST
+    /// resolved URL and then held fixed: the manager keys its bookkeeping on this, and the node
+    /// identifies the relay via Noise regardless, so it must not change when we fail over.
+    private var peerId: Data
     /// ONE link, one WebSocket. The BearerManager translates this local id into its global id space, and
     /// mints a fresh global on every reconnect (linkDown forgets the old mapping), so the node sees each
     /// reconnection as a new link, which is correct.
@@ -49,9 +63,27 @@ public final class RelayBearer: NSObject, Bearer {
     private var stableWork: DispatchWorkItem?      // F-13: fires after RELAY_STABLE_S to reset backoff
     private var retryAfter: Double?                // F-13: server-driven backoff from a 429 Retry-After
 
+    /// Fixed-URL construction. Unchanged behavior, retained for callers that genuinely have one
+    /// relay (tests, the ble-lab client, a pinned deployment).
     public init(relayURL: String) {
-        self.relayURL = relayURL
+        self.resolveURL = { relayURL }
+        self.reportOutcome = { _, _ in }
         self.peerId = RelayBearer.stablePeerId(forURL: relayURL)
+        super.init()
+    }
+
+    /// Pooled construction: resolve the endpoint per dial attempt and report each outcome, so a
+    /// failing relay is scored down and the next attempt lands somewhere healthier (DESIGN.md §19).
+    /// `seedURL` fixes the synthetic peer id up front so the manager's bookkeeping is stable across
+    /// failover.
+    public init(
+        seedURL: String,
+        resolveURL: @escaping () -> String?,
+        reportOutcome: @escaping (String, Bool) -> Void
+    ) {
+        self.resolveURL = resolveURL
+        self.reportOutcome = reportOutcome
+        self.peerId = RelayBearer.stablePeerId(forURL: seedURL)
         super.init()
     }
 
@@ -61,7 +93,7 @@ public final class RelayBearer: NSObject, Bearer {
         queue.async { [weak self] in
             guard let self, !self.started else { return }
             self.started = true
-            log("STATE", "relay node-start url=\(self.relayURL) peer=\(shortHex(self.peerId))")
+            log("STATE", "relay node-start peer=\(shortHex(self.peerId))")
             self.dial()
         }
     }
@@ -88,7 +120,16 @@ public final class RelayBearer: NSObject, Bearer {
     // MARK: - dial / receive / reconnect (all on `queue`)
 
     private func dial() {
-        guard started, let url = URL(string: relayURL) else { return }
+        guard started else { return }
+        // Resolve per attempt so failover works without a live re-register (see `resolveURL`).
+        guard let candidate = resolveURL(), !candidate.isEmpty, let url = URL(string: candidate) else {
+            // Nothing dialable: every pooled endpoint is backed off. Wait for the next tick rather
+            // than treating this as a permanent stop, or a transient outage would end reach.
+            currentURL = nil
+            scheduleReconnect()
+            return
+        }
+        currentURL = candidate
         let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
         self.session = session
         let task = session.webSocketTask(with: url)
@@ -118,6 +159,10 @@ public final class RelayBearer: NSObject, Bearer {
     /// Tear the current socket down (idempotent), surface linkDown once, then schedule a reconnect.
     private func handleDown() {
         stableWork?.cancel(); stableWork = nil       // F-13: the link didn't stay stable
+        // Report BEFORE scheduling the next attempt, so the pool has already scored this endpoint
+        // down by the time `dial()` asks it where to go. Reporting after would re-pick the corpse.
+        if let url = currentURL { reportOutcome(url, false) }
+        currentURL = nil
         if up { up = false; sink?.linkDown(linkId) }
         task = nil
         session?.invalidateAndCancel(); session = nil
@@ -155,6 +200,8 @@ extension RelayBearer: URLSessionWebSocketDelegate {
         queue.async { [weak self] in
             guard let self, webSocketTask === self.task else { return }
             self.up = true
+            // Score the endpoint that actually answered, not whatever the pool would return now.
+            if let url = self.currentURL { self.reportOutcome(url, true) }
             log("STATE", "relay link-up peer=\(shortHex(self.peerId))")
             self.sink?.linkUp(self.linkId, role: .dialer, peerId: self.peerId)   // dialer = Noise initiator
             self.receiveLoop()

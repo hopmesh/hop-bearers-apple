@@ -608,18 +608,35 @@ final class Central: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         }
         guard let channel else { return }
         log("STATE", "l2cap-open success (dialer) id=\(p.identifier.uuidString.prefix(8))")
-        execute(core.channelOpened(p.identifier), current: p)                   // clear dial timeout + backoff
+        execute(core.channelOpened(p.identifier), current: p)                   // clear dial timeout ONLY
         // SPEC §8.1 iOS adaptation: construct Link on the I/O thread that owns bleRunLoop.
         let id = p.identifier
         let myId = self.myId, mintLinkId = self.mintLinkId, onLink = self.onLink, onData = self.onData
         let onCloseBearer = self.onClose
+        // Link callbacks fire on the bleRunLoop I/O thread (Link.handle / Link.close), but CentralCore
+        // is documented as single-homed on bleQueue and therefore holds no locks. Touching it from the
+        // I/O thread is a data race on `retained`/`backoff`/`failCount`; hop back explicitly.
         let onCloseChain: (Link) -> Void = { [weak self] l in
-            if let self { self.execute(self.core.dialerLinkClosed(id, stableUp: l.stableUp), current: nil) }
+            let stable = l.stableUp
+            bleQueue.async { [weak self] in
+                guard let self else { return }
+                self.execute(self.core.dialerLinkClosed(id, stableUp: stable), current: nil)
+            }
             onCloseBearer(l)
+        }
+        // android-05/06 parity: declare the dial a SUCCESS at HELLO-complete, not at L2CAP-open, so a
+        // peer that accepts a channel and never says HELLO keeps accruing backoff. The core is
+        // single-homed on bleQueue while the Link is built inside bleRunLoop.perform, so hop back.
+        let onUpChain: (Link) -> Void = { [weak self] l in
+            bleQueue.async { [weak self] in
+                guard let self else { return }
+                self.execute(self.core.dialerLinkUp(id), current: nil)
+            }
+            onLink(l)
         }
         bleRunLoop.perform {
             _ = Link(channel: channel, linkId: mintLinkId(), isDialer: true, myId: myId,
-                     onUp: onLink, onData: onData, onClose: onCloseChain)
+                     onUp: onUpChain, onData: onData, onClose: onCloseChain)
         }
     }
 

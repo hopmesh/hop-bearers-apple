@@ -156,8 +156,12 @@ final class CentralCoreTests: XCTestCase {
         _ = c.discovered(idA, advPrefix: lesserPrefix)
         _ = c.dialTimeoutFired(idA)                       // failure 1 -> 2.0s
         XCTAssertEqual(c.backoff[hex(lesserPrefix)] ?? .nan, 1002.0, accuracy: 0.0001)
+        // A second failure needs a second DIAL: `disconnected` only charges a peer that is actually
+        // in flight, so a stray cancel can no longer be billed as a dial failure.
+        clock = 1003
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
         XCTAssertEqual(c.disconnected(idA), [.cancelDialTimeout(idA)])  // failure 2 -> 4.0s
-        XCTAssertEqual(c.backoff[hex(lesserPrefix)] ?? .nan, 1004.0, accuracy: 0.0001)
+        XCTAssertEqual(c.backoff[hex(lesserPrefix)] ?? .nan, 1007.0, accuracy: 0.0001)
         XCTAssertEqual(c.failCount[hex(lesserPrefix)], 2)
     }
 
@@ -166,10 +170,12 @@ final class CentralCoreTests: XCTestCase {
     /// used to collapse the schedule back to ~1s forever; now it keeps climbing into quarantine.
     func testBackoffGrowsEvenWhenEachDeadlineHasAlreadyLapsed() {
         let c = makeCore(myId: myId)
-        _ = c.discovered(idA, advPrefix: lesserPrefix)
         let key = hex(lesserPrefix)
         var previous = 0.0
         for failure in 1...8 {
+            // Each failure needs its own DIAL: `disconnected` only charges a peer actually in
+            // flight, so a stray cancel is no longer billed as a dial failure.
+            _ = c.discovered(idA, advPrefix: lesserPrefix)
             _ = c.disconnected(idA)
             let delay = (c.backoff[key] ?? .nan) - clock
             XCTAssertGreaterThanOrEqual(
@@ -184,16 +190,47 @@ final class CentralCoreTests: XCTestCase {
                        "a chronically failing target ends up quarantined, not re-dialed every ~13s")
     }
 
-    /// A peer that finally answers is healthy again, so both the deadline and the count clear.
-    func testSuccessResetsTheFailureCount() {
+    /// A peer that completes HELLO is healthy again, so both the deadline and the count clear.
+    func testHelloCompleteResetsTheFailureCount() {
         let c = makeCore(myId: myId)
         _ = c.discovered(idA, advPrefix: lesserPrefix)
         _ = c.disconnected(idA)
+        clock = 1003
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
         _ = c.disconnected(idA)
         XCTAssertEqual(c.failCount[hex(lesserPrefix)], 2)
-        _ = c.channelOpened(idA)
-        XCTAssertNil(c.failCount[hex(lesserPrefix)], "an answered dial clears the history")
+        clock = 1010
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
+        _ = c.dialerLinkUp(idA)
+        XCTAssertNil(c.failCount[hex(lesserPrefix)], "a completed HELLO clears the history")
         XCTAssertNil(c.backoff[hex(lesserPrefix)])
+    }
+
+    func testAStrayCancelIsNotBilledAsADialFailure() {
+        // BEARER-03: the core's own cancels (already-linked, dialerLinkClosed) return as
+        // didDisconnect. Billing those as dial failures quarantined a peer for up to ~120s purely
+        // for being reachable. Only a dial actually in flight may be charged.
+        let c = makeCore(myId: myId)
+        XCTAssertEqual(c.disconnected(idA), [], "a peer we never dialed cannot fail a dial")
+        XCTAssertNil(c.failCount[idA.uuidString])
+        XCTAssertNil(c.backoff[idA.uuidString])
+    }
+
+    func testReachingAnAlreadyLinkedPeerClearsItsFailureState() {
+        // Android treats reaching the peer as a SUCCESS (`succeededForAddr`); Apple charged it as a
+        // failure. Reaching a peer proves it is healthy, whichever side dialed.
+        let c = makeCore(myId: myId)
+        let peer = nodeId(0x11)
+        let key = hex(peer.prefix(6))
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
+        _ = c.disconnected(idA)                       // accrue a failure first
+        clock = 1005
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
+        linkedPeers.insert(peer)                      // we are already linked to this nodeId
+        let effects = c.readEndpointValue(idA, psm: 0x0080, peerId: peer)
+        XCTAssertEqual(effects, [.cancelDialTimeout(idA), .cancelConnection(idA)])
+        XCTAssertNil(c.failCount[key], "reaching an already-linked peer clears its failure state")
+        XCTAssertNil(c.backoff[key])
     }
 
     func testBackoffRateLimitsRediscovery() {
@@ -210,6 +247,7 @@ final class CentralCoreTests: XCTestCase {
         _ = c.discovered(idA, advPrefix: lesserPrefix)
         _ = c.dialTimeoutFired(idA)                       // backoff[hex(lesserPrefix)] = 1002
         clock = 1000 + LOST_S + 10                        // 1040: past LOST_S for the first key
+        _ = c.discovered(idB, advPrefix: nil)             // dial idB so its failure is chargeable
         _ = c.disconnected(idB)                           // reconnect(idB) runs evictBackoff (cut = 1010)
         XCTAssertNil(c.backoff[hex(lesserPrefix)], "the stale key (1002) is evicted")
         XCTAssertNotNil(c.backoff[idB.uuidString], "the fresh key survives")
@@ -237,14 +275,44 @@ final class CentralCoreTests: XCTestCase {
         XCTAssertFalse(c.retained.contains(idA))
     }
 
-    func testChannelOpenedClearsTimerAndBackoff() {
+    func testChannelOpenedClearsTheTimerButNotTheBackoff() {
+        // android-05/06 parity. Opening the L2CAP channel is NOT proof of a healthy peer: the link
+        // is not up until HELLO. Clearing here pinned failCount at 1 forever for a peer that accepts
+        // a channel and never says HELLO, making the growth curve and the 120s quarantine
+        // unreachable for exactly the peer they exist to park.
         let c = makeCore(myId: myId)
         _ = c.discovered(idA, advPrefix: lesserPrefix)
         _ = c.dialTimeoutFired(idA)                        // seeds backoff[hex(lesserPrefix)]
-        clock = 1002
+        clock = 1003
         _ = c.discovered(idA, advPrefix: lesserPrefix)     // re-dial
         XCTAssertEqual(c.channelOpened(idA), [.cancelDialTimeout(idA)])
-        XCTAssertNil(c.backoff[hex(lesserPrefix)], "a successful open resets the peer's backoff")
+        XCTAssertNotNil(c.backoff[hex(lesserPrefix)], "L2CAP-open alone must NOT clear the backoff")
+        XCTAssertNotNil(c.failCount[hex(lesserPrefix)], "nor the failure count")
+
+        // HELLO completed: NOW the peer is proven healthy.
+        XCTAssertEqual(c.dialerLinkUp(idA), [])
+        XCTAssertNil(c.backoff[hex(lesserPrefix)], "HELLO-complete resets the peer's backoff")
+        XCTAssertNil(c.failCount[hex(lesserPrefix)])
+    }
+
+    func testAPeerThatNeverCompletesHelloAccruesBackoffToQuarantine() {
+        // The regression this whole seam exists for: connect -> L2CAP opens -> no HELLO -> reaped.
+        // Under the old reset point this looped forever at a flat ~2s. It must now climb.
+        let c = makeCore(myId: myId)
+        let key = hex(lesserPrefix)
+        var previous = 0.0
+        for _ in 1...8 {
+            _ = c.discovered(idA, advPrefix: lesserPrefix)   // dial (gate passes: clock is past backoff)
+            _ = c.channelOpened(idA)                         // L2CAP opens, but HELLO never arrives
+            _ = c.dialerLinkClosed(idA, stableUp: false)     // the no-HELLO reaper closes it
+            _ = c.disconnected(idA)                          // ...and the cancel lands as didDisconnect
+            let delay = (c.backoff[key] ?? .nan) - clock
+            XCTAssertGreaterThanOrEqual(delay, previous, "backoff must grow across no-HELLO cycles")
+            previous = delay
+            clock = (c.backoff[key] ?? clock) + 1            // wait out the window, then advert again
+        }
+        XCTAssertEqual(previous, BACKOFF_QUARANTINE_S, accuracy: 0.0001,
+                       "a peer that never completes HELLO must end up quarantined")
     }
 
     func testChannelOpenFailedReReads() {

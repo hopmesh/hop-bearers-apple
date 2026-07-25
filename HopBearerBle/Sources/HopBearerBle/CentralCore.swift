@@ -88,7 +88,12 @@ final class CentralCore {
     /// dialing, then the apple-02(c)/apple-r2-02 dial-vs-defer decision. Dialing immediately returns the
     /// dial effects; deferring records the pending wait and asks the shell to arm the WAIT_BASE_S fallback.
     func discovered(_ id: UUID, advPrefix: Data?) -> [CentralEffect] {
-        let bkey = advPrefix.map(hex) ?? id.uuidString
+        // Read the R2 window under the PROMOTED key when this advert carries no prefix. Apple
+        // peripherals structurally cannot advertise manufacturer data, so `advPrefix` is permanently
+        // nil for an Apple peer: the gate read `id.uuidString` while every failure was FILED under
+        // the nodeId prefix promoted at PSM-read time, so the two keys never met and the rate limit
+        // was inert for exactly the peers it most needed to throttle.
+        let bkey = (advPrefix ?? advPrefixById[id]).map(hex) ?? id.uuidString
         if let until = backoff[bkey], now() < until { return [] }           // SPEC R2: rate-limited
         if let pre = advPrefix, haveLinkToPrefix(pre) { return [] }          // SPEC R4: already linked
         guard !retained.contains(id) else { return [] }                     // already dialing
@@ -118,7 +123,10 @@ final class CentralCore {
     /// SPEC §3.2.2/3.2.3: begin a dial. Retain the peer, promote the backoff key, arm the dial timeout.
     private func dial(_ id: UUID, _ advPrefix: Data?) -> [CentralEffect] {
         retained.insert(id)
-        advPrefixById[id] = advPrefix
+        // Only record a prefix we actually have. Assigning nil here used to CLOBBER the stable
+        // nodeId prefix promoted by `readEndpointValue`, so the promotion survived only inside a
+        // single post-read dial cycle and the backoff key reverted to the (rotatable) identifier.
+        if let advPrefix { advPrefixById[id] = advPrefix }
         return [.connect(id), .armDialTimeout(id)]
     }
 
@@ -135,7 +143,15 @@ final class CentralCore {
     }
 
     /// didFailToConnect / didDisconnect both reconnect (SPEC §6 backoff schedule).
-    func disconnected(_ id: UUID) -> [CentralEffect] { reconnect(id) }
+    func disconnected(_ id: UUID) -> [CentralEffect] {
+        // Only charge a failure for a dial that was actually in flight. Without this guard the
+        // core's OWN cancels (the already-linked branch below, and dialerLinkClosed) came back as
+        // didDisconnect and were billed as dial failures against a peer we had demonstrably just
+        // reached, quarantining a one-metre-away peer for up to ~120s. Android treats reaching the
+        // peer as a SUCCESS (`succeededForAddr`); this is the mirror-image asymmetry.
+        guard retained.contains(id) else { return [] }
+        return reconnect(id)
+    }
 
     /// SPEC §6: release the peer, then set the next backoff deadline from the CONSECUTIVE failure count
     /// (2 s, 4 s, 8 s, 16 s, 30 s cap, then a ~2 min quarantine past BACKOFF_QUARANTINE_AFTER), plus
@@ -167,6 +183,15 @@ final class CentralCore {
     /// the L2CAP channel. `psm`/`peerId` are parsed by the shell from the CBCharacteristic value.
     func readEndpointValue(_ id: UUID, psm: UInt16, peerId: Data) -> [CentralEffect] {
         if haveLinkTo(peerId) {                                             // SPEC R4: already linked
+            // Reaching a peer we are already linked to PROVES it is healthy, so promote its stable
+            // key and clear its failure state before cancelling, exactly as Android does
+            // (`succeededForAddr` on the already-linked branch). Previously this redundant dial was
+            // billed as a failure by the follow-on didDisconnect, so a peer one metre away could be
+            // quarantined for ~120s purely for being reachable.
+            advPrefixById[id] = peerId.prefix(6)
+            let key = hex(peerId.prefix(6))
+            backoff[key] = nil
+            failCount[key] = nil
             retained.remove(id)
             return [.cancelDialTimeout(id), .cancelConnection(id)]
         }
@@ -174,14 +199,29 @@ final class CentralCore {
         return [.openL2CAP(id, psm: psm)]
     }
 
-    /// didOpen success: the dial landed. Clear the dial timeout and reset backoff for the peer. The Link
-    /// itself is constructed by the shell (it owns the CBL2CAPChannel); nothing here touches `retained`
-    /// because the peer stays retained for the life of the link.
+    /// didOpen success: the L2CAP channel is open. Clears the dial timeout ONLY; success is declared
+    /// later, at HELLO-complete, by `dialerLinkUp`. The Link itself is constructed by the shell (it
+    /// owns the CBL2CAPChannel); nothing here touches `retained` because the peer stays retained for
+    /// the life of the link.
     func channelOpened(_ id: UUID) -> [CentralEffect] {
+        // android-05/06 parity: the socket is connected but the link is NOT yet up (no HELLO).
+        // Cancel the dial timeout (this dial did reach L2CAP), but do NOT declare success here.
+        // Clearing the failure state on L2CAP-open pinned `failCount` at 1 forever for any peer
+        // that accepts a channel and never completes HELLO (the documented iOS ~30s L2CAP teardown,
+        // a wedged stack, a half-dead peer): each cycle cleared the count, the 3s no-HELLO reaper
+        // closed the link, and reconnect() recomputed from zero. The 4/8/16/30s growth and the
+        // 120s quarantine added in #323 were therefore UNREACHABLE for exactly the peer they exist
+        // to park. Android moved this reset to HELLO-complete for this reason; Apple never did.
+        return [.cancelDialTimeout(id)]
+    }
+
+    /// HELLO completed on a link we dialed: NOW the peer is proven healthy, so clear its failure
+    /// state. Mirrors Android's `dialerLinkUp` -> `DialState.succeededForAddr`.
+    func dialerLinkUp(_ id: UUID) -> [CentralEffect] {
         let key = advPrefixById[id].map(hex) ?? id.uuidString
         backoff[key] = nil
-        failCount[key] = nil          // a peer that answered is healthy again, whatever its history
-        return [.cancelDialTimeout(id)]
+        failCount[key] = nil
+        return []
     }
 
     /// didOpen error: a stale PSM. Re-read by re-discovering services (SPEC §7.4).

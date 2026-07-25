@@ -59,7 +59,7 @@ final class FramingTests: XCTestCase {
     func testOversizedLengthIsFlaggedOverLimit() {
         var d = BleDeframer()
         var over = false
-        let out = d.feed([0x7F, 0xFF, 0xFF, 0xFF], overLimit: &over)   // ~2 GiB, past MAX_FRAME (4 MiB)
+        let out = d.feed([0x7F, 0xFF, 0xFF, 0xFF], overLimit: &over)   // ~2 GiB, past MAX_FRAME (1 MiB)
         XCTAssertTrue(over)
         XCTAssertEqual(out, [])
     }
@@ -83,7 +83,7 @@ final class FramingTests: XCTestCase {
 
     func testMaxSizedFrameIsAccepted() {
         var d = BleDeframer()
-        let body = [UInt8](repeating: 0x5A, count: 4 * 1024 * 1024)   // exactly MAX_FRAME
+        let body = [UInt8](repeating: 0x5A, count: MAX_FRAME)   // exactly MAX_FRAME (the protocol cap)
         var over = false
         let out = d.feed(bleFrame(body), overLimit: &over)
         XCTAssertFalse(over)

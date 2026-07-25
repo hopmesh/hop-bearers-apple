@@ -40,7 +40,12 @@ let DEAD_BG_S: Double = 15.0  // background liveness deadline (iOS relaxes conn 
 let REAP_S: Double  = 3.0     // half-open (no-HELLO) reaper
 let WAIT_BASE_S: Double = 4.0 // wait-timeout safety net (SPEC §2.2)
 let DIAL_TIMEOUT_S: Double = 12.0
-let MAX_FRAME = 4 * 1024 * 1024
+// Reject a length prefix over the PROTOCOL's own cap. This was 4 MiB, four times
+// `MAX_BUNDLE_WIRE_BYTES`, so BLE (the most attacker-adjacent transport, no pairing, any stranger in
+// radio range) accepted a 4 MiB length prefix for a bundle `Bundle::from_bytes` rejects at 1 MiB:
+// 4x the per-frame memory commitment for bytes that could never be valid. The comment on the Android
+// twin even claimed it matched LAN, which is 1 MiB. Matched to LAN and to the protocol.
+let MAX_FRAME = 1 << 20
 let STABLE_UP_MS: UInt64 = 30_000
 let LOST_S: Double = 30.0
 
