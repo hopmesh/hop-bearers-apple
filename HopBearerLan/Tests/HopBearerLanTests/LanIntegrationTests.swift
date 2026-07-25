@@ -265,8 +265,12 @@ final class LanIntegrationTests: XCTestCase {
         let stalled = RawPeer(host: "127.0.0.1", port: port, onReady: { _ in }, onBody: { _ in })
         peers.append(stalled); stalled.start()
         XCTAssertTrue(spinWait { bearer.testPendingLinkCount == 1 })
-        XCTAssertTrue(spinWait(7.0) { bearer.testPendingLinkCount == 0 },
-                      "the shared maintenance timer reaps a no-HELLO peer")
+        // Jump the clock past LAN_REAP_S and run the SAME maintenance pass the shared timer runs,
+        // instead of racing a 1 s tick against a 5 s deadline inside a 7 s budget (that raced on a
+        // loaded runner and failed ~2 runs in 3). bearers/CLAUDE.md: pin the ordering, do not sleep.
+        bearer.testRunMaintenance(atMs: nowMs() + UInt64((LAN_REAP_S + 1.0) * 1000))
+        XCTAssertTrue(spinWait { bearer.testPendingLinkCount == 0 },
+                      "maintenance reaps a peer that never completed HELLO")
 
         let validId = randId()
         let valid = RawPeer(host: "127.0.0.1", port: port,

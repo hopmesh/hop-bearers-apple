@@ -617,6 +617,22 @@ extension LanBearer {
         }
     }
 
+    /// Test seam: run the SAME per-link maintenance pass the shared timer runs, at an INJECTED
+    /// clock. Exists because the reap test was a race by arithmetic, not by luck: the no-HELLO
+    /// deadline is LAN_REAP_S (5 s) but the timer only ticks every LAN_PING_S (1 s), so the reap
+    /// lands somewhere in 5-6 s while the test also has to pay for connection setup. On a loaded
+    /// runner that overran its budget and the test failed roughly two runs in three. Waiting longer
+    /// would just move the goalposts; `bearers/CLAUDE.md` says to pin the ordering rather than
+    /// sleep, so a test can jump the clock past the deadline and assert the reap deterministically.
+    ///
+    /// Uses the same `lanQueue` the timer handler runs on, so it observes exactly the production
+    /// ordering and needs no extra locking. Never call it from `lanQueue` itself.
+    func testRunMaintenance(atMs: UInt64) {
+        lanQueue.sync {
+            for link in Array(self.allLinksByLinkId.values) { link.maintenance(atMs) }
+        }
+    }
+
     /// Drive the REAL dialer path to a specific host:port, exactly as the browser callback does for a
     /// discovered peer (self-check + one-in-flight dedup + dial()), but without needing an mDNS sighting.
     func testDial(host: String, port: UInt16, peerId: Data) {
