@@ -4,6 +4,9 @@ Notable changes, generated from [conventional commits](https://www.conventionalc
 git-cliff. Do not edit by hand.
 ## Unreleased
 
+### Bug Fixes
+- kill the LAN reap-test flake by pinning the ordering (a16a715)
+
 ### CI
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 - per-repo release workflows (publish on a vX.Y.Z tag) (277cf32)
@@ -14,6 +17,7 @@ git-cliff. Do not edit by hand.
 - finish the monorepo layout, kill platform stubs, unify the platform axis (O-1/O-3/O-4/O-5) (#115) (b56bb49)
 
 ### Documentation
+- regenerate from conventional commits (1572ae2)
 - regenerate from conventional commits (a355901)
 - branded, marketable READMEs for every sub-repo (9c2a477)
 
