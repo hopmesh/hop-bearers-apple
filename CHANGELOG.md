@@ -17,6 +17,7 @@ git-cliff. Do not edit by hand.
 - finish the monorepo layout, kill platform stubs, unify the platform axis (O-1/O-3/O-4/O-5) (#115) (b56bb49)
 
 ### Documentation
+- regenerate from conventional commits (330c8c6)
 - regenerate from conventional commits (096180b)
 - regenerate from conventional commits (102ae67)
 - regenerate from conventional commits (1572ae2)
@@ -28,6 +29,7 @@ git-cliff. Do not edit by hand.
 - auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 
 ### Other
+- extract Multipeer so EVERY bearer registers with the manager (f3949f7)
 - cut the frame cap to the protocol's, and pin it (2a16945)
 - Apple was resetting the dial backoff at the wrong moment (f94599f)
 - wire the relay pool end to end, and stop the wire guard false-firing (35946e0)
