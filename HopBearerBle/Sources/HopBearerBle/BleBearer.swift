@@ -277,7 +277,18 @@ public final class BleBearer: Bearer {
     private let mapLock = NSLock()
     private var linksByPeerId = [Data: DedupLink]()  // dedup: one survivor per peer (SPEC §2.3)
     private var linksByLinkId = [LinkId: DedupLink]() // send routing + linkUp/linkDown pairing
+    // PLAT-001: EVERY constructed Link, from the moment its channel opens until it closes, including
+    // the ones that have not completed HELLO yet. The two maps above are populated in onUp, so before
+    // this existed a link that was mid-handshake when stop() ran was in neither of them and nothing
+    // could close it: it kept its 1 Hz PING alive, completed HELLO afterwards, and surfaced a link on
+    // a transport the user had just switched off. Both LAN bearers already kept this map
+    // (`allLinksByLinkId`); the BLE pair were the only two without it.
+    private var allLinks = [LinkId: DedupLink]()
     private var nextLinkId: LinkId = 1               // minted under mapLock
+    // PLAT-001: set by stop(), cleared by start(). A radio callback (an accepted L2CAP channel, a
+    // dial that completes) can land after stop() has returned, and a link formed then must never
+    // reach the consumer. The LAN bearers have carried the same flag since F-11.
+    private var stopped = false
     var status: Timer?
     // apple-02(a): the background-task assertion that keeps an in-flight receive alive across a suspend.
     // Held while backgrounded WITH at least one live link, renewed on each inbound frame, ended on
@@ -321,6 +332,30 @@ public final class BleBearer: Bearer {
         let id = nextLinkId; nextLinkId += 1; return id
     }
 
+    // MARK: - PLAT-001 lifecycle: adopt every link at CONSTRUCTION, not at HELLO
+
+    /// Called by the radio shells the instant a `Link` is constructed, before HELLO. Registers it so
+    /// `closeAllLinks()` can reach it, or closes it immediately if the bearer is already stopped (the
+    /// callback that produced it was queued before stop() and landed after).
+    func adopt(_ link: DedupLink) {
+        mapLock.lock()
+        if stopped {
+            mapLock.unlock()
+            link.close("bearer-stopped")
+            return
+        }
+        allLinks[link.linkId] = link
+        mapLock.unlock()
+    }
+
+    /// stop(): from here on no link may be adopted or surfaced. Set synchronously by the bearer's
+    /// `stop()` before any radio teardown, so the guarantee holds the moment stop() returns even
+    /// though the teardown itself is dispatched (see BleBearer+Radio.swift).
+    func markStopped() { mapLock.lock(); stopped = true; mapLock.unlock() }
+    /// start(): the bearer is meant to be running again.
+    func markStarted() { mapLock.lock(); stopped = false; mapLock.unlock() }
+    var isStopped: Bool { mapLock.lock(); defer { mapLock.unlock() }; return stopped }
+
     /// dial gate (Central, on bleQueue): read the peer map under the lock.
     func haveLinkTo(_ peer: Data) -> Bool {
         mapLock.lock(); defer { mapLock.unlock() }
@@ -345,12 +380,18 @@ public final class BleBearer: Bearer {
 
     func onUp(_ link: DedupLink) {                  // HELLO completed: dedup, then surface the survivor
         guard let peer = link.peerId else { return }
+        // PLAT-001: HELLO can complete after the bearer was stopped (the user switched the transport
+        // off while this channel was mid-handshake). Surfacing it here would hand the consumer a link
+        // on a transport that is supposed to be down, so close it instead of announcing it. It was
+        // never in linksByLinkId, so this close emits no linkDown.
+        guard !isStopped else { link.close("bearer-stopped"); return }
         // apple-12: dedup BEFORE surfacing. The clean room surfaced both legs of a duplicate pair and
         // let dedup close the loser afterwards, which handed the node a doomed handshake start + teardown
         // per simultaneous mutual dial (handshake churn, plausible securing-stuck / link-id-churn cause).
         // Now the loser never reaches sink.linkUp: only the survivor is announced.
         mapLock.lock()
         linksByLinkId[link.linkId] = link           // register for send routing + linkDown pairing
+        allLinks[link.linkId] = link                // PLAT-001: idempotent; adopt() normally got here first
         let existing = linksByPeerId[peer]
         var drop: DedupLink? = nil
         if let existing, existing !== link {        // SPEC §2.3 dedup
@@ -406,6 +447,7 @@ public final class BleBearer: Bearer {
 
     func onClose(_ link: DedupLink) {               // SPEC R3: identity-checked removal
         mapLock.lock()
+        if allLinks[link.linkId] === link { allLinks.removeValue(forKey: link.linkId) }   // PLAT-001
         let wasUp = linksByLinkId.removeValue(forKey: link.linkId) != nil        // true iff registered in onUp
         if let peer = link.peerId, linksByPeerId[peer] === link { linksByPeerId.removeValue(forKey: peer) }
         let noLinksLeft = linksByPeerId.isEmpty
@@ -421,7 +463,12 @@ public final class BleBearer: Bearer {
     func closeAllLinks() {                          // SPEC R11: drop all local links on power-off / stop
         // close() invalidates the link's RunLoop timers + closes its streams, which must happen on the
         // thread that owns bleRunLoop (CFRunLoop thread-affinity). onPowerOff fires on bleQueue, so hop.
-        mapLock.lock(); let links = Array(linksByPeerId.values); mapLock.unlock()
+        //
+        // PLAT-001: this iterates `allLinks`, not `linksByPeerId`. The peer map holds only links that
+        // completed HELLO, so closing it alone left every mid-handshake channel running with its own
+        // ping/watchdog timers and its selfRetain keeping it alive: exactly the link that then came up
+        // on a "disabled" transport.
+        mapLock.lock(); let links = Array(allLinks.values); mapLock.unlock()
         bleRunLoop.perform { for l in links { l.close("power-off") } }
     }
 }
@@ -437,6 +484,8 @@ extension BleBearer {
     func debugLink(forPeer peer: Data) -> DedupLink? { mapLock.lock(); defer { mapLock.unlock() }; return linksByPeerId[peer] }
     /// Whether a linkId is currently registered for send-routing / linkDown pairing.
     func debugHasLinkId(_ id: LinkId) -> Bool { mapLock.lock(); defer { mapLock.unlock() }; return linksByLinkId[id] != nil }
+    /// PLAT-001: every link the bearer is tracking, INCLUDING ones that have not completed HELLO.
+    var debugTrackedLinkCount: Int { mapLock.lock(); defer { mapLock.unlock() }; return allLinks.count }
     /// The application-background bookkeeping flag (mirrors bleAppInBackground).
     var debugAppInBackground: Bool { appInBackground }
 }

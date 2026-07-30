@@ -272,6 +272,7 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
     private var healScheduled = false
     private let myId: Data
     private let mintLinkId: () -> LinkId
+    private let onAdopt: (Link) -> Void
     private let onLink: (Link) -> Void
     private let onData: (Link, Data) -> Void
     private let onClose: (Link) -> Void
@@ -281,10 +282,11 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
     #endif
 
     init(myId: Data, suppressAdvertising: Bool, mintLinkId: @escaping () -> LinkId,
+         onAdopt: @escaping (Link) -> Void,
          onLink: @escaping (Link) -> Void, onData: @escaping (Link, Data) -> Void,
          onClose: @escaping (Link) -> Void, onPowerOff: @escaping () -> Void) {
         self.core = PeripheralCore(myId: myId, suppressAdvertising: suppressAdvertising)
-        self.myId = myId; self.mintLinkId = mintLinkId
+        self.myId = myId; self.mintLinkId = mintLinkId; self.onAdopt = onAdopt
         self.onLink = onLink; self.onData = onData; self.onClose = onClose; self.onPowerOff = onPowerOff
         super.init()
         pm = CBPeripheralManager(delegate: self, queue: bleQueue,
@@ -417,9 +419,14 @@ final class Peripheral: NSObject, CBPeripheralManagerDelegate {
         // SPEC §8.1 iOS adaptation: hand the channel to the I/O thread so Stream.schedule(in: bleRunLoop)
         // + Timer additions run on the thread that owns bleRunLoop. No-op when bleRunLoop == .main.
         let myId = self.myId, mintLinkId = self.mintLinkId, onLink = self.onLink, onData = self.onData, onClose = self.onClose
+        let onAdopt = self.onAdopt
         bleRunLoop.perform {
-            _ = Link(channel: channel, linkId: mintLinkId(), isDialer: false, myId: myId,
-                     onUp: onLink, onData: onData, onClose: onClose)
+            let link = Link(channel: channel, linkId: mintLinkId(), isDialer: false, myId: myId,
+                            onUp: onLink, onData: onData, onClose: onClose)
+            // PLAT-001: hand the link to the bearer BEFORE HELLO, so stop() can close it. This is the
+            // acceptor half of the race: an inbound channel that arrives just as the user switches the
+            // transport off used to be reachable from no bearer map at all.
+            onAdopt(link)
         }
     }
 
@@ -446,17 +453,19 @@ final class Central: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     private var dialTimers = [UUID: DispatchWorkItem]() // SPEC R6: 12 s dial-timeout per peer
 
     private let mintLinkId: () -> LinkId
+    private let onAdopt: (Link) -> Void
     private let onLink: (Link) -> Void
     private let onData: (Link, Data) -> Void
     private let onClose: (Link) -> Void
     private let onPowerOff: () -> Void
 
     init(myId: Data, mintLinkId: @escaping () -> LinkId,
+         onAdopt: @escaping (Link) -> Void,
          onLink: @escaping (Link) -> Void, onData: @escaping (Link, Data) -> Void,
          onClose: @escaping (Link) -> Void, onPowerOff: @escaping () -> Void,
          haveLinkTo: @escaping (Data) -> Bool, haveLinkToPrefix: @escaping (Data) -> Bool) {
         self.core = CentralCore(myId: myId, haveLinkTo: haveLinkTo, haveLinkToPrefix: haveLinkToPrefix)
-        self.myId = myId; self.mintLinkId = mintLinkId
+        self.myId = myId; self.mintLinkId = mintLinkId; self.onAdopt = onAdopt
         self.onLink = onLink; self.onData = onData; self.onClose = onClose; self.onPowerOff = onPowerOff
         super.init()
         cm = CBCentralManager(delegate: self, queue: bleQueue,
@@ -634,9 +643,11 @@ final class Central: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             }
             onLink(l)
         }
+        let onAdopt = self.onAdopt
         bleRunLoop.perform {
-            _ = Link(channel: channel, linkId: mintLinkId(), isDialer: true, myId: myId,
-                     onUp: onUpChain, onData: onData, onClose: onCloseChain)
+            let link = Link(channel: channel, linkId: mintLinkId(), isDialer: true, myId: myId,
+                            onUp: onUpChain, onData: onData, onClose: onCloseChain)
+            onAdopt(link)   // PLAT-001: adopt before HELLO so stop() can close a dial in flight
         }
     }
 
@@ -653,51 +664,113 @@ final class Central: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
 // MARK: - BleBearer radio wiring: start/stop/wake (construct + drive the CB planes) ---------------
 
+// PLAT-002 (threading): `Central`/`CentralCore` and `Peripheral`/`PeripheralCore` are documented as
+// single-homed on `bleQueue` and therefore hold NO locks (CentralCore.swift:15-16), and the timers the
+// bearer schedules live on `bleRunLoop`, which has CFRunLoop thread affinity. start()/stop() used to
+// run their whole body on whichever thread called them, which since per-transport enablement is the
+// driver's `hop.bearer.control` queue, concurrently with CB delegate callbacks on bleQueue: two threads
+// mutating `cbPeers`/`dialTimers`/`retained`. Every body below is therefore dispatched to the queue
+// that owns the state it touches, the same shape MultipeerBearer/LanBearer/RelayBearer already use.
+//
+// The dispatch is ASYNC on purpose, and that has a consequence worth stating rather than glossing.
+// BearerManager documents "a bearer's start/stop touches radios and can block", and bleQueue defaults
+// to `.main`, so a `bleQueue.sync` hop from a main-thread caller would deadlock instantly and there is
+// no portable way to ask "am I already on this queue" for a queue the HOST assigns. Teardown therefore
+// cannot be made synchronous here.
+//
+// So `stop()` is NOT radio-silent on return. What IS synchronous, set by markStopped() before anything
+// is dispatched:
+//
+//   • no link can be adopted, and no HELLO that completes afterwards can surface (BleBearer.adopt /
+//     onUp both refuse), so the CONSUMER-visible guarantee BearerManager.setEnabled(tag,false)
+//     advertises holds the instant it returns;
+//   • already-tracked links, including pre-HELLO ones, are closed (closeAllLinks).
+//
+// What is DEFERRED, for as long as bleQueue takes to drain the work queued ahead of the teardown block:
+// `CBPeripheralManager.stopAdvertising`, unpublishing the GATT service, and `CBCentralManager.stopScan`.
+// Until that block runs the device is still advertising and still scanning, and a discovery callback
+// already queued can still start one more dial. Those channels cannot become links (adopt refuses them
+// and closes them), but the RADIO is not off yet. Anyone who needs true radio silence as a postcondition
+// must wait on bleQueue themselves; this bearer does not promise it.
 extension BleBearer {
     public func start() {
         log("STATE", "node-start myId=\(hex(myId)) (greater-nodeId dials)")
-        peripheral = Peripheral(myId: myId, suppressAdvertising: suppressAdvertising,
-            mintLinkId: { [weak self] in self?.mint() ?? 0 },
-            onLink:     { [weak self] in self?.onUp($0) },
-            onData:     { [weak self] in self?.onData($0, $1) },
-            onClose:    { [weak self] in self?.onClose($0) },
-            onPowerOff: { [weak self] in self?.closeAllLinks() })
-        central = Central(myId: myId,
-            mintLinkId: { [weak self] in self?.mint() ?? 0 },
-            onLink:     { [weak self] in self?.onUp($0) },
-            onData:     { [weak self] in self?.onData($0, $1) },
-            onClose:    { [weak self] in self?.onClose($0) },
-            onPowerOff: { [weak self] in self?.closeAllLinks() },
-            haveLinkTo:       { [weak self] in self?.haveLinkTo($0) ?? false },
-            haveLinkToPrefix: { [weak self] pre in self?.haveLinkToPrefix(pre) ?? false })
-
-        let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.printStatus() }
-        bleRunLoop.add(t, forMode: .common)
-        status = t
-
+        markStarted()
+        bleQueue.async { [weak self] in
+            guard let self else { return }
+            self.peripheral = Peripheral(myId: self.myId, suppressAdvertising: self.suppressAdvertising,
+                mintLinkId: { [weak self] in self?.mint() ?? 0 },
+                onAdopt:    { [weak self] in self?.adopt($0) },
+                onLink:     { [weak self] in self?.onUp($0) },
+                onData:     { [weak self] in self?.onData($0, $1) },
+                onClose:    { [weak self] in self?.onClose($0) },
+                onPowerOff: { [weak self] in self?.closeAllLinks() })
+            self.central = Central(myId: self.myId,
+                mintLinkId: { [weak self] in self?.mint() ?? 0 },
+                onAdopt:    { [weak self] in self?.adopt($0) },
+                onLink:     { [weak self] in self?.onUp($0) },
+                onData:     { [weak self] in self?.onData($0, $1) },
+                onClose:    { [weak self] in self?.onClose($0) },
+                onPowerOff: { [weak self] in self?.closeAllLinks() },
+                haveLinkTo:       { [weak self] in self?.haveLinkTo($0) ?? false },
+                haveLinkToPrefix: { [weak self] pre in self?.haveLinkToPrefix(pre) ?? false })
+        }
         #if os(iOS)
         // The BLE bearer owns its own background-wake: an iBeacon region monitor that relaunches a
         // force-quit app and pokes the Central back into scanning (BACKGROUND.md Layer C). Routed to
         // the same wake() the AppDelegate calls, so there is one wake path regardless of trigger.
+        //
+        // DELIBERATELY LEFT INLINE, on the caller's thread, exactly as it was. This is CLLocationManager,
+        // not CoreBluetooth: it is not `Central`/`Peripheral` state, it is not touched from bleQueue, and
+        // it is therefore outside the single-homing problem the rest of this extension fixes. The path is
+        // device-verified killed-iOS wake (see the beacon-UUID byte-match history in BeaconWake.swift), so
+        // it does not get re-queued as a side effect of a threading fix aimed at somewhere else.
         let bw = BeaconWake { [weak self] reason in self?.wake(reason) }
         bw.start()
         beaconWake = bw
         #endif
+        // The STATUS timer belongs to bleRunLoop, so schedule (and later invalidate) it there: a Timer
+        // must be invalidated on the thread whose run loop it was added to.
+        bleRunLoop.perform { [weak self] in
+            guard let self else { return }
+            let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.printStatus() }
+            bleRunLoop.add(t, forMode: .common)
+            self.status = t
+        }
     }
 
+    /// Stops the bearer as a LINK SOURCE synchronously and its RADIOS asynchronously. See the drain-window
+    /// note above the extension: on return no new link can be adopted or surfaced and every tracked link is
+    /// closing, but the advertiser, the published GATT service and the scanner keep running until bleQueue
+    /// reaches the block below.
     public func stop() {
-        status?.invalidate(); status = nil
+        // Synchronous, before anything is dispatched: after this returns no link can be adopted and no
+        // HELLO can surface, which is the guarantee BearerManager.setEnabled(tag, false) advertises.
+        markStopped()
         bgAssertion.end("bearer-stop")   // apple-02(a): never strand the assertion
+        closeAllLinks()                  // hops to bleRunLoop; closes pre-HELLO links too (PLAT-001)
+        bleRunLoop.perform { [weak self] in self?.status?.invalidate(); self?.status = nil }
         #if os(iOS)
-        beaconWake?.stop(); beaconWake = nil
+        beaconWake?.stop(); beaconWake = nil    // inline, as before: CoreLocation, not CoreBluetooth
         #endif
-        closeAllLinks()
-        central?.stop(); central = nil
-        peripheral?.stop(); peripheral = nil
+        bleQueue.async { [weak self] in
+            guard let self else { return }
+            self.central?.stop(); self.central = nil
+            self.peripheral?.stop(); self.peripheral = nil
+        }
     }
 
-    /// Called from the iOS AppDelegate on a CoreLocation region wake.
-    public func wake(_ reason: String) { central?.wake(reason) }
+    /// Called from the iOS AppDelegate, or from this bearer's own BeaconWake, on a CoreLocation region
+    /// wake. The hop to bleQueue is here only because `central` is now ASSIGNED on bleQueue by start()
+    /// above, so reading the property from the wake thread would be a race on the reference itself. It
+    /// is behaviour-neutral for the wake path: `Central.wake` has always dispatched its own body to
+    /// bleQueue, so the work happens on the same queue at the same point it always did. There is no
+    /// stopped-check here on purpose: a killed-app relaunch races start(), and dropping the wake
+    /// because the flag has not flipped yet is exactly how a force-quit device stops re-linking.
+    /// A nil `central` is already a harmless no-op.
+    public func wake(_ reason: String) {
+        bleQueue.async { [weak self] in self?.central?.wake(reason) }
+    }
 }
 
 // MARK: - misc ----------------------------------------------------------------------------------

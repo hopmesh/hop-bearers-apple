@@ -187,6 +187,114 @@ final class BleBearerDedupTests: XCTestCase {
         XCTAssertEqual(l2.closedWhy, "power-off")
     }
 
+    // MARK: PLAT-001 stop must reach links that have not completed HELLO
+    //
+    // The bug: a Link was registered ONLY in onUp (i.e. at HELLO), so a channel that was open but
+    // still handshaking when the user switched the transport off was in no bearer map, nothing closed
+    // it, its 1 Hz PING kept it alive, and it then surfaced a link on a "disabled" transport. Both
+    // LAN bearers already tracked pre-HELLO links; the BLE pair did not. Each assert below fails
+    // against that behaviour.
+
+    func testStopClosesALinkThatNeverCompletedHello() {
+        let (b, sink) = makeBearer(myId: nodeId(0x02))
+        let preHello = FakeLink(1, peer: nodeId(0x01), isDialer: false)
+        b.adopt(preHello)                       // channel open, HELLO not yet arrived
+        XCTAssertEqual(b.debugTrackedLinkCount, 1, "an adopted link is tracked before HELLO")
+        XCTAssertEqual(b.debugPeerLinkCount, 0, "and is in NO peer map until HELLO")
+
+        b.stop()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))   // closeAllLinks hops to bleRunLoop
+        XCTAssertEqual(preHello.closedWhy, "power-off", "stop() must close a link that never HELLO-ed")
+
+        // If its HELLO lands anyway (the callback was already in flight), it is refused, not surfaced.
+        b.onUp(preHello)
+        XCTAssertEqual(sink.ups.count, 0, "a stopped bearer must not surface a link")
+        XCTAssertEqual(b.debugPeerLinkCount, 0)
+        XCTAssertEqual(preHello.closedWhy, "bearer-stopped")
+    }
+
+    func testAdoptWhileStoppedClosesImmediatelyAndTracksNothing() {
+        let (b, _) = makeBearer(myId: nodeId(0x02))
+        b.stop()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        let late = FakeLink(9, peer: nodeId(0x01), isDialer: true)
+        b.adopt(late)                           // a dial that completed after stop() returned
+        XCTAssertEqual(late.closedWhy, "bearer-stopped")
+        XCTAssertEqual(b.debugTrackedLinkCount, 0, "a stopped bearer tracks nothing")
+    }
+
+    func testStopThenStartRestoresAdoptionAndSurfacing() {
+        let (b, sink) = makeBearer(myId: nodeId(0x02))
+        b.stop()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertTrue(b.isStopped)
+        b.markStarted()                         // start() without constructing CoreBluetooth planes
+        XCTAssertFalse(b.isStopped)
+
+        let link = FakeLink(1, peer: nodeId(0x01), isDialer: true)
+        b.adopt(link)
+        b.onUp(link)
+        XCTAssertEqual(sink.ups.map { $0.0 }, [1], "a restarted bearer surfaces links again")
+        XCTAssertNil(link.closedWhy)
+        XCTAssertEqual(b.debugTrackedLinkCount, 1)
+    }
+
+    func testCloseAllLinksReachesPreHelloAndEstablishedLinksAlike() {
+        let (b, _) = makeBearer(myId: nodeId(0x02))
+        let established = FakeLink(1, peer: nodeId(0x01), isDialer: true)
+        let preHello = FakeLink(2, peer: nodeId(0x03), isDialer: false)
+        b.adopt(established); b.onUp(established)
+        b.adopt(preHello)                        // never HELLO-ed
+        XCTAssertEqual(b.debugTrackedLinkCount, 2)
+
+        b.closeAllLinks()                        // the BT-power-off path
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertEqual(established.closedWhy, "power-off")
+        XCTAssertEqual(preHello.closedWhy, "power-off", "power-off must reach a half-open channel too")
+    }
+
+    func testOnCloseForgetsATrackedLink() {
+        let (b, _) = makeBearer(myId: nodeId(0x02))
+        let link = FakeLink(4, peer: nodeId(0x01), isDialer: true)
+        b.adopt(link)
+        XCTAssertEqual(b.debugTrackedLinkCount, 1)
+        b.onClose(link)
+        XCTAssertEqual(b.debugTrackedLinkCount, 0, "a closed link must not be retained by the tracker")
+    }
+
+    // PLAT-002 (the testable half): the link tracker is touched from the I/O thread (adopt/onUp/onClose
+    // run on bleRunLoop) and from the lifecycle path (markStopped/closeAllLinks on the caller's queue).
+    // Swift Dictionary reads concurrent with mutation are undefined behaviour, so hammer both at once;
+    // an unsynchronised `allLinks` corrupts or traps here. The CoreBluetooth shells cannot be driven in
+    // a unit test (no headless CB), so their single-homing is enforced structurally, not here.
+    func testTrackerSurvivesConcurrentAdoptionAndTeardown() {
+        let (b, _) = makeBearer(myId: nodeId(0x02))
+        let done = expectation(description: "concurrent churn")
+        done.expectedFulfillmentCount = 2
+        // Built with an explicit loop and explicit types: as a single `(0..<200).map { ... }` closure the
+        // Swift type checker cannot solve LinkId/UInt8/Bool from the literals in reasonable time and the
+        // whole test target fails to compile.
+        var links: [FakeLink] = []
+        for i in 0..<200 {
+            let id: LinkId = LinkId(i + 1)
+            let peer: Data = nodeId(UInt8(i % 200))
+            let dialer: Bool = (i % 2 == 0)
+            links.append(FakeLink(id, peer: peer, isDialer: dialer))
+        }
+        DispatchQueue.global().async {
+            for l in links { b.adopt(l); b.onClose(l) }
+            done.fulfill()
+        }
+        DispatchQueue.global().async {
+            for i in 0..<200 {
+                _ = b.debugTrackedLinkCount
+                if i % 2 == 0 { b.markStopped() } else { b.markStarted() }
+            }
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 10)
+    }
+
     // MARK: apple-02(a) background bookkeeping
 
     func testSetBackgroundTracksTheFlagAndBgAssertionPaths() {
