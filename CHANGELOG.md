@@ -5,6 +5,7 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- per-mirror repository, and retryable release artifacts (bf04449)
 - make the PLAT-001 tests actually run, and correct what the last commit claimed (15065c8)
 - disabling a transport now actually stops it (PLAT-001) (7b84c71)
 - kill the LAN reap-test flake by pinning the ordering (a16a715)
@@ -19,6 +20,7 @@ git-cliff. Do not edit by hand.
 - finish the monorepo layout, kill platform stubs, unify the platform axis (O-1/O-3/O-4/O-5) (#115) (b56bb49)
 
 ### Documentation
+- regenerate from conventional commits (2741000)
 - regenerate from conventional commits (b96e019)
 - regenerate from conventional commits (330c8c6)
 - regenerate from conventional commits (096180b)
