@@ -41,6 +41,11 @@ final class CentralCore {
     private let now: () -> Double
     private let jitter: () -> Double
     private let appInBackground: () -> Bool
+    /// How many consecutive didOpen errors a device may cause before the connection is torn down
+    /// instead of re-read again. A genuinely stale PSM clears on the first or second re-read, so this
+    /// only ever bites a cause that re-reading cannot fix, which is what produced the observed spin.
+    private let MAX_CONSECUTIVE_OPEN_FAILURES = 3
+
     private let haveLinkTo: (Data) -> Bool
     private let haveLinkToPrefix: (Data) -> Bool
 
@@ -144,6 +149,7 @@ final class CentralCore {
 
     /// didFailToConnect / didDisconnect both reconnect (SPEC §6 backoff schedule).
     func disconnected(_ id: UUID) -> [CentralEffect] {
+        openFailures[id] = nil          // the connection is gone; the next dial starts a fresh run
         // Only charge a failure for a dial that was actually in flight. Without this guard the
         // core's OWN cancels (the already-linked branch below, and dialerLinkClosed) came back as
         // didDisconnect and were billed as dial failures against a peer we had demonstrably just
@@ -204,6 +210,7 @@ final class CentralCore {
     /// owns the CBL2CAPChannel); nothing here touches `retained` because the peer stays retained for
     /// the life of the link.
     func channelOpened(_ id: UUID) -> [CentralEffect] {
+        openFailures[id] = nil          // a channel opened, so any consecutive-failure run is over
         // android-05/06 parity: the socket is connected but the link is NOT yet up (no HELLO).
         // Cancel the dial timeout (this dial did reach L2CAP), but do NOT declare success here.
         // Clearing the failure state on L2CAP-open pinned `failCount` at 1 forever for any peer
@@ -224,8 +231,41 @@ final class CentralCore {
         return []
     }
 
-    /// didOpen error: a stale PSM. Re-read by re-discovering services (SPEC §7.4).
-    func channelOpenFailed(_ id: UUID) -> [CentralEffect] { [.discoverServices(id)] }
+    /// didOpen error. SPEC §7.4 reads this as a stale PSM and re-reads by re-discovering services,
+    /// which is right for a stale PSM and wrong for every other cause, because the re-read is issued
+    /// immediately and without bound.
+    ///
+    /// Observed on a device: a cross-dial (both sides dialling at once) makes CoreBluetooth refuse the
+    /// open with "L2CAP PSM already connected". That is not a stale PSM, it is OUR OWN channel, so the
+    /// re-read produces the identical error and the peer spin-loops read psm, openL2CAP, error,
+    /// re-read against a peer it is successfully talking to, burning radio and GATT operations with no
+    /// exit. haveLinkTo cannot see it, because linksByPeerId is only populated once HELLO completes,
+    /// and that window is exactly where the spin lives.
+    ///
+    /// Two bounds, because the two causes want different answers:
+    ///   1. A link to this device's known nodeId prefix already exists, so the error IS that link.
+    ///      Cancel rather than re-read; this dial was redundant.
+    ///   2. Otherwise allow a bounded number of consecutive re-reads. A genuinely stale PSM clears on
+    ///      the first or second, so past that the connection is torn down and the ordinary reconnect
+    ///      and backoff path takes over instead of a hot loop.
+    func channelOpenFailed(_ id: UUID) -> [CentralEffect] {
+        if let pre = advPrefixById[id], haveLinkToPrefix(pre) {
+            openFailures[id] = nil
+            retained.remove(id)
+            return [.cancelDialTimeout(id), .cancelConnection(id)]
+        }
+        let n = (openFailures[id] ?? 0) + 1
+        openFailures[id] = n
+        if n > MAX_CONSECUTIVE_OPEN_FAILURES {
+            openFailures[id] = nil
+            retained.remove(id)
+            return [.cancelDialTimeout(id), .cancelConnection(id)]
+        }
+        return [.discoverServices(id)]
+    }
+
+    /// Consecutive didOpen errors per device, cleared by a successful open, a disconnect or a stop.
+    private var openFailures = [UUID: Int]()
 
     /// The dialer's own link closed (chained ahead of the bearer's onClose). Reset backoff if the link
     /// was long-lived (SPEC §6), and cancel the connection so didDisconnect -> reconnect re-arms the dial.
@@ -265,5 +305,6 @@ final class CentralCore {
     func stopReset() {
         retained.removeAll()
         pendingWaits.removeAll()
+        openFailures.removeAll()
     }
 }

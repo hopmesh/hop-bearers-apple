@@ -390,4 +390,52 @@ final class CentralCoreTests: XCTestCase {
         XCTAssertTrue(c.retained.isEmpty)
         XCTAssertTrue(c.pendingWaits.isEmpty)
     }
+    // MARK: channelOpenFailed, the observed device spin
+
+    /// The bug, measured on an iPhone: a cross-dial makes CoreBluetooth refuse with "L2CAP PSM already
+    /// connected", the core treated it as a stale PSM per SPEC 7.4, re-read, got the identical error,
+    /// and looped forever against a peer it was talking to. Once the link registers, the error IS that
+    /// link, so the answer is to cancel rather than re-read.
+    func testAnOpenFailureAgainstAnAlreadyLinkedPeerCancelsRatherThanReReading() {
+        let c = makeCore(myId: myId)
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
+        _ = c.readEndpointValue(idA, psm: 192, peerId: nodeId(0x11))   // promotes advPrefixById
+        linkedPrefixes = [nodeId(0x11).prefix(6)]                       // HELLO completed meanwhile
+        XCTAssertEqual(c.channelOpenFailed(idA), [.cancelDialTimeout(idA), .cancelConnection(idA)],
+                       "the open error IS our own link, so re-reading can only reproduce it")
+    }
+
+    /// The window before HELLO registers the link is exactly where the spin lived, so an unbounded
+    /// re-read is wrong even when no link is visible yet.
+    func testConsecutiveOpenFailuresAreBoundedAndThenTearDown() {
+        let c = makeCore(myId: myId)
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
+        XCTAssertEqual(c.channelOpenFailed(idA), [.discoverServices(idA)], "1st re-read is the SPEC 7.4 stale-PSM case")
+        XCTAssertEqual(c.channelOpenFailed(idA), [.discoverServices(idA)])
+        XCTAssertEqual(c.channelOpenFailed(idA), [.discoverServices(idA)])
+        XCTAssertEqual(c.channelOpenFailed(idA), [.cancelDialTimeout(idA), .cancelConnection(idA)],
+                       "past the bound the connection is torn down so reconnect+backoff takes over")
+    }
+
+    /// A stale PSM that resolves must not leave the device one failure closer to a teardown.
+    func testASuccessfulOpenClearsTheFailureRun() {
+        let c = makeCore(myId: myId)
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
+        _ = c.channelOpenFailed(idA)
+        _ = c.channelOpenFailed(idA)
+        _ = c.channelOpened(idA)
+        XCTAssertEqual(c.channelOpenFailed(idA), [.discoverServices(idA)],
+                       "the run reset, so this is a fresh first re-read")
+    }
+
+    /// The counter is per device, so one bad peer cannot spend another peer's budget.
+    func testTheFailureRunIsPerDevice() {
+        let c = makeCore(myId: myId)
+        _ = c.discovered(idA, advPrefix: lesserPrefix)
+        _ = c.discovered(idB, advPrefix: lesserPrefix)
+        for _ in 0..<4 { _ = c.channelOpenFailed(idA) }
+        XCTAssertEqual(c.channelOpenFailed(idB), [.discoverServices(idB)],
+                       "idB is untouched by idA's failures")
+    }
+
 }
