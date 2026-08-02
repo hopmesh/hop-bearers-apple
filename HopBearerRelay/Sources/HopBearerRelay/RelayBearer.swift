@@ -14,14 +14,88 @@
 // from the transport, just a STABLE synthetic peerId for the BearerManager's bookkeeping. We derive it
 // deterministically from the relay URL (SHA-256 prefix) so it's identical every reconnect; the node
 // ignores it. This bearer names nothing about BLE/LAN; it is written purely against start/stop/send/sink.
+//
+// TOR: there is no Tor code here and there should not be. A host that wants relay traffic to ride Tor
+// runs a proxy (the Tor daemon, or Arti embedded in the app) and passes its `SocksProxy` in; the dial
+// string then just happens to be a `.onion` URL, which the pool and this bearer treat like any other.
+// See docs/tor.md for what that does and, importantly, does not hide.
 
 import Foundation
+import Network
 import CryptoKit
 import HopContract   // the bearer contract (no libhop)
 
 private let RELAY_BACKOFF_MIN_S: Double = 1.0
 private let RELAY_BACKOFF_MAX_S: Double = 30.0
 private let RELAY_STABLE_S: Double = 20.0   // F-13: only reset backoff after the link holds this long
+
+/// A SOCKS5 proxy every relay dial is routed through, e.g. a local Tor or Arti listener on
+/// `127.0.0.1:9050`.
+///
+/// Hop embeds no Tor implementation and does not want one: Tor is a whole networking stack with its
+/// own release cadence and threat surface, and the host app (or the OS) is already the thing that
+/// knows whether a proxy is running. Pointing the socket at a proxy the host supplies is the entire
+/// integration, and it is transport-generic: this is a SOCKS5 setting, not a Tor setting.
+///
+/// The proxy also does the name resolution (the target hostname is handed to it unresolved), which
+/// is what makes a `.onion` dial string work at all: there is no DNS record to look up. See
+/// `docs/tor.md`.
+public struct SocksProxy: Equatable, Sendable {
+    public let host: String
+    public let port: UInt16
+
+    public init(host: String, port: UInt16) {
+        self.host = host
+        self.port = port
+    }
+
+    /// Parse a `host:port` spec, e.g. `127.0.0.1:9050` or `[::1]:9050`. Returns nil for anything
+    /// that is not a complete, usable endpoint, so a half-filled config can never be read as "no
+    /// proxy wanted" by one caller and "proxy at some default" by another.
+    public static func parse(_ spec: String?) -> SocksProxy? {
+        guard let raw = spec?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+        let host: String
+        let portText: Substring
+        if raw.hasPrefix("["), let close = raw.firstIndex(of: "]") {
+            // Bracketed IPv6: the colons inside the address are not the separator.
+            host = String(raw[raw.index(after: raw.startIndex)..<close])
+            let after = raw[raw.index(after: close)...]
+            guard after.hasPrefix(":") else { return nil }
+            portText = after.dropFirst()
+        } else {
+            guard let colon = raw.lastIndex(of: ":"), raw.firstIndex(of: ":") == colon else { return nil }
+            host = String(raw[raw.startIndex..<colon])
+            portText = raw[raw.index(after: colon)...]
+        }
+        guard !host.isEmpty, let port = UInt16(portText), port > 0 else { return nil }
+        return SocksProxy(host: host, port: port)
+    }
+}
+
+/// What the host's proxy setting resolved to, decided ONCE at construction.
+///
+/// The third case is the point. A setting that was supplied but does not parse must never quietly
+/// become "dial direct": that is a typo turning into a clearnet connection the user believes is
+/// proxied. Resolving the spec into three explicit states makes that impossible to get wrong later,
+/// because the dial path has no "no proxy configured" branch it can fall into by accident.
+public enum SocksProxySetting: Equatable, Sendable {
+    /// No proxy configured. Dial normally (the default for every existing caller).
+    case direct
+    /// Dial every relay connection through this proxy.
+    case proxy(SocksProxy)
+    /// A proxy WAS configured but the spec is unusable. Never dial.
+    case unusable
+
+    /// Resolve a host-supplied `host:port` spec. Nil, empty, or whitespace means no proxy was asked
+    /// for; anything else must parse or the bearer refuses to dial at all.
+    public init(spec: String?) {
+        guard let raw = spec?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else {
+            self = .direct
+            return
+        }
+        self = SocksProxy.parse(raw).map { SocksProxySetting.proxy($0) } ?? .unusable
+    }
+}
 
 public final class RelayBearer: NSObject, Bearer {
     public weak var sink: LinkSink?
@@ -46,6 +120,8 @@ public final class RelayBearer: NSObject, Bearer {
     /// resolved URL and then held fixed: the manager keys its bookkeeping on this, and the node
     /// identifies the relay via Noise regardless, so it must not change when we fail over.
     private var peerId: Data
+    /// How the host's proxy setting resolved. `.direct` for every caller that configured none.
+    private let socks: SocksProxySetting
     /// ONE link, one WebSocket. The BearerManager translates this local id into its global id space, and
     /// mints a fresh global on every reconnect (linkDown forgets the old mapping), so the node sees each
     /// reconnection as a new link, which is correct.
@@ -65,10 +141,13 @@ public final class RelayBearer: NSObject, Bearer {
 
     /// Fixed-URL construction. Unchanged behavior, retained for callers that genuinely have one
     /// relay (tests, the ble-lab client, a pinned deployment).
-    public init(relayURL: String) {
+    /// `socksProxy` is a `host:port` spec (e.g. a local Tor listener at `127.0.0.1:9050`); nil or
+    /// empty dials direct, and an unparseable value refuses to dial rather than falling back to it.
+    public init(relayURL: String, socksProxy: String? = nil) {
         self.resolveURL = { relayURL }
         self.reportOutcome = { _, _ in }
         self.peerId = RelayBearer.stablePeerId(forURL: relayURL)
+        self.socks = SocksProxySetting(spec: socksProxy)
         super.init()
     }
 
@@ -79,11 +158,13 @@ public final class RelayBearer: NSObject, Bearer {
     public init(
         seedURL: String,
         resolveURL: @escaping () -> String?,
-        reportOutcome: @escaping (String, Bool) -> Void
+        reportOutcome: @escaping (String, Bool) -> Void,
+        socksProxy: String? = nil
     ) {
         self.resolveURL = resolveURL
         self.reportOutcome = reportOutcome
         self.peerId = RelayBearer.stablePeerId(forURL: seedURL)
+        self.socks = SocksProxySetting(spec: socksProxy)
         super.init()
     }
 
@@ -130,7 +211,20 @@ public final class RelayBearer: NSObject, Bearer {
             return
         }
         currentURL = candidate
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        guard let configuration = RelayBearer.sessionConfiguration(socks: socks) else {
+            // The host asked for every relay byte to go through a proxy and it cannot be applied
+            // (an unusable spec, or an OS without proxyConfigurations). FAIL CLOSED: dialing direct
+            // would put the connection on the clearnet, which is the exact thing the caller
+            // configured a proxy to avoid, and it would do so silently. handleDown() reports the
+            // attempt as a failure against this endpoint, which is honest, from this node the
+            // endpoint really is unreachable, and it gives the UI its "no reach" signal instead of
+            // a pool that looks healthy while nothing ever connects. It also puts the retry on the
+            // normal backoff rather than a hot loop.
+            log("STATE", "relay dial refused: SOCKS proxy configured but unusable (endpoint or OS)")
+            handleDown()
+            return
+        }
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
         self.session = session
         let task = session.webSocketTask(with: url)
         self.task = task
@@ -262,6 +356,35 @@ extension RelayBearer {
 
     /// The next exponential backoff after a plain drop / too-short link: double, capped at the max (F-13).
     static func nextBackoff(_ current: Double) -> Double { min(current * 2, RELAY_BACKOFF_MAX_S) }
+
+    /// The URLSession configuration for one dial: plain when no proxy is configured, SOCKS5-routed
+    /// when one is.
+    ///
+    /// Returns nil when a proxy was requested but cannot be applied, and the caller must then NOT
+    /// dial (see `dial()`). Two ways that happens: an unusable setting (`.unusable`, e.g. a typo in
+    /// the host's config), and an OS older than iOS 17 / macOS 14, where `proxyConfigurations` does
+    /// not exist. The package still supports iOS 16 / macOS 13, and on those a proxied relay simply
+    /// does not connect. That is deliberate: a silent clearnet fallback is worse than no reach,
+    /// because the user believes their IP is hidden from the relay when it is not.
+    static func sessionConfiguration(socks: SocksProxySetting) -> URLSessionConfiguration? {
+        let cfg = URLSessionConfiguration.default
+        let proxy: SocksProxy
+        switch socks {
+        case .direct: return cfg
+        case .unusable: return nil
+        case .proxy(let p): proxy = p
+        }
+        guard #available(iOS 17.0, macOS 14.0, *) else { return nil }
+        guard let port = NWEndpoint.Port(rawValue: proxy.port) else { return nil }
+        // Hand the proxy the HOSTNAME, never a resolved address: a .onion name has no DNS record,
+        // so the proxy is the only thing that can resolve it, and resolving locally would leak the
+        // lookup even when it could succeed. URLSession does this for us (verified in the
+        // integration tests: the proxy sees SOCKS5 ATYP 0x03 with the literal hostname).
+        cfg.proxyConfigurations = [
+            ProxyConfiguration(socksv5Proxy: .hostPort(host: NWEndpoint.Host(proxy.host), port: port))
+        ]
+        return cfg
+    }
 
     /// Parse a server-driven Retry-After from a FAILED WS upgrade. Only a 429 backs off this way: a numeric
     /// Retry-After header is honored verbatim; a 429 with a missing / non-numeric header falls back to the

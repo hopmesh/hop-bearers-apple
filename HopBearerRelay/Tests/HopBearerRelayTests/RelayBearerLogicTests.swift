@@ -106,6 +106,74 @@ final class RelayBearerLogicTests: XCTestCase {
         XCTAssertEqual(RelayBearer.reconnectDelay(retryAfter: nil, backoff: 4.0, jitter: 0.25), 4.25)
     }
 
+    // MARK: SOCKS proxy spec parsing (the host-supplied Tor hook).
+
+    func testSocksProxyParsesHostAndPort() {
+        XCTAssertEqual(SocksProxy.parse("127.0.0.1:9050"), SocksProxy(host: "127.0.0.1", port: 9050))
+        XCTAssertEqual(SocksProxy.parse("  localhost:9150  "), SocksProxy(host: "localhost", port: 9150),
+                       "surrounding whitespace in a config value must not defeat the parse")
+        XCTAssertEqual(SocksProxy.parse("[::1]:9050"), SocksProxy(host: "::1", port: 9050),
+                       "a bracketed IPv6 literal keeps its own colons")
+    }
+
+    func testSocksProxyRejectsAnythingIncomplete() {
+        // A half-filled setting must be nil, not a partial proxy: "no proxy" and "proxy somewhere I
+        // did not ask for" are both wrong answers, and the second one leaks.
+        XCTAssertNil(SocksProxy.parse(nil))
+        XCTAssertNil(SocksProxy.parse(""))
+        XCTAssertNil(SocksProxy.parse("   "))
+        XCTAssertNil(SocksProxy.parse("127.0.0.1"), "no port")
+        XCTAssertNil(SocksProxy.parse(":9050"), "no host")
+        XCTAssertNil(SocksProxy.parse("127.0.0.1:"), "empty port")
+        XCTAssertNil(SocksProxy.parse("127.0.0.1:notaport"))
+        XCTAssertNil(SocksProxy.parse("127.0.0.1:0"), "port 0 is not a listener")
+        XCTAssertNil(SocksProxy.parse("127.0.0.1:99999"), "out of UInt16 range")
+        XCTAssertNil(SocksProxy.parse("::1:9050"), "an unbracketed IPv6 literal is ambiguous, not a guess")
+        XCTAssertNil(SocksProxy.parse("[::1]9050"), "brackets without the port separator")
+    }
+
+    // MARK: the three-state setting. Absent = direct, good = proxy, present-but-broken = never dial.
+
+    func testSocksProxySettingResolvesTheThreeStates() {
+        XCTAssertEqual(SocksProxySetting(spec: nil), .direct)
+        XCTAssertEqual(SocksProxySetting(spec: ""), .direct)
+        XCTAssertEqual(SocksProxySetting(spec: "   "), .direct)
+        XCTAssertEqual(SocksProxySetting(spec: "127.0.0.1:9050"), .proxy(SocksProxy(host: "127.0.0.1", port: 9050)))
+    }
+
+    func testAConfiguredButBrokenSpecIsUnusableNotDirect() {
+        // The whole reason this is three states and not an optional. A typo must NOT read as "the
+        // user did not want a proxy", or one bad character silently puts relay traffic on the
+        // clearnet while the user believes it is proxied.
+        XCTAssertEqual(SocksProxySetting(spec: "127.0.0.1;9050"), .unusable)
+        XCTAssertEqual(SocksProxySetting(spec: "127.0.0.1"), .unusable)
+        XCTAssertEqual(SocksProxySetting(spec: "127.0.0.1:0"), .unusable)
+    }
+
+    // MARK: session configuration. Direct = plain; proxy = SOCKS5; unusable = nil (fail closed).
+
+    func testSessionConfigurationWithoutAProxyIsPlain() {
+        let cfg = RelayBearer.sessionConfiguration(socks: .direct)
+        XCTAssertNotNil(cfg, "the default path must always produce a configuration")
+        if #available(iOS 17.0, macOS 14.0, *) {
+            XCTAssertTrue(cfg?.proxyConfigurations.isEmpty ?? false, "no proxy was asked for, so none is set")
+        }
+    }
+
+    func testSessionConfigurationWithAProxyCarriesExactlyOneProxy() throws {
+        guard #available(iOS 17.0, macOS 14.0, *) else {
+            throw XCTSkip("proxyConfigurations needs iOS 17 / macOS 14; the bearer fails closed below that")
+        }
+        let cfg = try XCTUnwrap(RelayBearer.sessionConfiguration(socks: .proxy(SocksProxy(host: "127.0.0.1", port: 9050))))
+        XCTAssertEqual(cfg.proxyConfigurations.count, 1, "every dial routes through the one configured proxy")
+    }
+
+    func testSessionConfigurationFailsClosedOnAnUnusableProxy() {
+        // The dial path treats nil as "do not dial". Returning a plain configuration here instead
+        // would silently put a connection the user believes is proxied onto the clearnet.
+        XCTAssertNil(RelayBearer.sessionConfiguration(socks: .unusable))
+    }
+
     func testReconnectDelayJitterStaysWithinOneSecond() {
         // The production jitter is Double.random(in: 0...1); assert the delay for any such jitter lands in
         // [base, base+1] so the anti-lockstep spread is bounded.

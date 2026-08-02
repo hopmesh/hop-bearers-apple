@@ -133,6 +133,125 @@ private final class WSTestServer {
     }
 }
 
+// MARK: - A hand-rolled loopback SOCKS5 proxy (stands in for a local Tor / Arti listener) -----------
+//
+// It speaks just enough of RFC 1928 to prove the two things that actually matter for Tor reach:
+// URLSession really routes the WebSocket through the configured proxy, and it hands over the target
+// HOSTNAME (ATYP 0x03) rather than resolving it first, which is the only reason a `.onion` name can
+// work. After the handshake it splices bytes to the real loopback WS server, so the whole bearer
+// lifecycle runs over the proxied socket instead of being mocked.
+
+private final class SocksTestProxy {
+    private let listener: NWListener
+    private let q = DispatchQueue(label: "test.socks.proxy")
+    private let lock = NSLock()
+    private var _requestedHost: String?
+    private var _requestedPort: UInt16 = 0
+    private var _addressType: UInt8?
+    private var _conns: [NWConnection] = []
+    /// Where the proxy forwards to once the handshake completes.
+    private let upstreamPort: UInt16
+
+    private(set) var port: UInt16 = 0
+
+    /// The hostname the client asked the proxy to reach, and how it encoded it.
+    var requestedHost: String? { lock.lock(); defer { lock.unlock() }; return _requestedHost }
+    var requestedPort: UInt16 { lock.lock(); defer { lock.unlock() }; return _requestedPort }
+    var addressType: UInt8? { lock.lock(); defer { lock.unlock() }; return _addressType }
+
+    init(upstreamPort: UInt16) {
+        self.upstreamPort = upstreamPort
+        listener = try! NWListener(using: .tcp)
+    }
+
+    func start() {
+        listener.newConnectionHandler = { [weak self] c in self?.handle(c) }
+        let ready = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { if case .ready = $0 { ready.signal() } }
+        listener.start(queue: q)
+        _ = ready.wait(timeout: .now() + 3)
+        port = listener.port?.rawValue ?? 0
+    }
+
+    func stop() {
+        listener.cancel()
+        lock.lock(); let cs = _conns; _conns = []; lock.unlock()
+        cs.forEach { $0.cancel() }
+    }
+
+    private func track(_ c: NWConnection) { lock.lock(); _conns.append(c); lock.unlock() }
+
+    private func handle(_ client: NWConnection) {
+        track(client)
+        var buf = [UInt8]()
+        var greeted = false
+        var upstream: NWConnection?
+
+        func pumpUpstream(_ up: NWConnection) {
+            up.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, done, err in
+                if let data, !data.isEmpty {
+                    client.send(content: data, completion: .contentProcessed { _ in })
+                }
+                if done || err != nil { client.cancel(); return }
+                pumpUpstream(up)
+            }
+        }
+
+        func loop() {
+            client.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, err in
+                guard let self else { return }
+                if let data, !data.isEmpty {
+                    if let up = upstream {
+                        up.send(content: data, completion: .contentProcessed { _ in })
+                    } else {
+                        buf += [UInt8](data)
+                        // Greeting: VER NMETHODS METHODS... -> "no authentication".
+                        if !greeted, buf.count >= 2, buf.count >= 2 + Int(buf[1]) {
+                            buf.removeFirst(2 + Int(buf[1]))
+                            greeted = true
+                            client.send(content: Data([0x05, 0x00]), completion: .contentProcessed { _ in })
+                        }
+                        // CONNECT request: VER CMD RSV ATYP ADDR PORT.
+                        if greeted, buf.count >= 5 {
+                            let atyp = buf[3]
+                            let need = atyp == 0x03 ? 4 + 1 + Int(buf[4]) + 2 : (atyp == 0x01 ? 10 : 22)
+                            if buf.count >= need {
+                                self.lock.lock()
+                                self._addressType = atyp
+                                if atyp == 0x03 {
+                                    let len = Int(buf[4])
+                                    self._requestedHost = String(decoding: buf[5..<(5 + len)], as: UTF8.self)
+                                    self._requestedPort = UInt16(buf[need - 2]) << 8 | UInt16(buf[need - 1])
+                                }
+                                self.lock.unlock()
+                                buf.removeFirst(need)
+                                let up = NWConnection(host: "127.0.0.1",
+                                                      port: NWEndpoint.Port(rawValue: self.upstreamPort)!,
+                                                      using: .tcp)
+                                upstream = up
+                                self.track(up)
+                                up.start(queue: self.q)
+                                pumpUpstream(up)
+                                // Success reply; the bound address is unused by the client.
+                                client.send(content: Data([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]),
+                                            completion: .contentProcessed { _ in })
+                                if !buf.isEmpty {
+                                    up.send(content: Data(buf), completion: .contentProcessed { _ in })
+                                    buf.removeAll()
+                                }
+                            }
+                        }
+                    }
+                }
+                if done || err != nil { upstream?.cancel(); client.cancel(); return }
+                loop()
+            }
+        }
+        client.start(queue: q)
+        loop()
+    }
+}
+
 // MARK: - Recording sink + spin-wait ---------------------------------------------------------------
 
 private final class RecSink: LinkSink {
@@ -271,6 +390,67 @@ final class RelayIntegrationTests: XCTestCase {
             "with nothing dialable the bearer must keep asking, not give up"
         )
         XCTAssertTrue(sink.ups.isEmpty, "it must not fabricate a link when there is nowhere to dial")
+    }
+
+    // MARK: Tor: an .onion relay dialed through a SOCKS5 proxy, end to end over a real socket.
+
+    func testOnionRelayDialsThroughASocksProxyAndOpensALink() throws {
+        guard #available(iOS 17.0, macOS 14.0, *) else {
+            throw XCTSkip("proxyConfigurations needs iOS 17 / macOS 14; the bearer fails closed below that")
+        }
+        let server = WSTestServer(); server.start()
+        let proxy = SocksTestProxy(upstreamPort: server.port); proxy.start()
+        defer { server.stop(); proxy.stop() }
+        XCTAssertGreaterThan(proxy.port, 0, "the loopback SOCKS proxy must bind a port")
+
+        // A v3-shaped onion name that resolves NOWHERE. If the bearer resolved hostnames itself, or
+        // ignored the proxy, this dial could not possibly succeed, which is the point of the test.
+        let onion = "ws://i3azam4xowcraffcdopctb4uq7wq23uhi3azam4xowcraffcdopctb4d.onion/_hop"
+        let bearer = RelayBearer(relayURL: onion, socksProxy: "127.0.0.1:\(proxy.port)")
+        let sink = RecSink(); bearer.sink = sink
+        bearer.start()
+        defer { bearer.stop() }
+
+        XCTAssertTrue(spinWait(8) { !sink.ups.isEmpty },
+                      "the WebSocket upgrade completes through the proxy and surfaces linkUp")
+        XCTAssertEqual(sink.ups[0].1, .dialer, "we dialed out, so we are still the Noise initiator")
+        XCTAssertEqual(sink.ups[0].2, RelayBearer.stablePeerId(forURL: onion),
+                       "the bookkeeping peer id is derived the same way for an onion endpoint")
+
+        // The property that makes .onion work at all: the NAME went to the proxy, unresolved.
+        XCTAssertEqual(proxy.addressType, 0x03, "SOCKS5 ATYP 0x03 = domain name, not a resolved address")
+        XCTAssertEqual(proxy.requestedHost,
+                       "i3azam4xowcraffcdopctb4uq7wq23uhi3azam4xowcraffcdopctb4d.onion",
+                       "the full onion hostname is handed to the proxy to resolve")
+        XCTAssertEqual(proxy.requestedPort, 80, "the URL's implicit ws:// port rides along")
+
+        // And it is a working link, not just an open socket.
+        server.pushBinary([0x07, 0x08])
+        XCTAssertTrue(spinWait { sink.bytes.contains { Array($0.1) == [0x07, 0x08] } },
+                      "bytes flow over the proxied link like any other relay link")
+    }
+
+    func testAProxiedBearerNeverDialsDirectWhenTheProxyIsUnusable() {
+        // FAIL CLOSED. A configured-but-unusable proxy (here: a typo'd spec) must not degrade into
+        // a clearnet dial. The user's IP would be exposed to the relay while they believe it is not.
+        let server = WSTestServer(); server.start()
+        defer { server.stop() }
+        let lock = NSLock()
+        var outcomes: [(String, Bool)] = []
+        let bearer = RelayBearer(
+            seedURL: server.url,
+            resolveURL: { server.url },
+            reportOutcome: { url, ok in lock.withLock { outcomes.append((url, ok)) } },
+            socksProxy: "127.0.0.1;9050"   // a semicolon instead of a colon: configured, unusable
+        )
+        let sink = RecSink(); bearer.sink = sink
+        bearer.start()
+        defer { bearer.stop() }
+
+        XCTAssertTrue(spinWait(4) { lock.withLock { outcomes.contains { !$0.1 } } },
+                      "the refused dial is reported as a failure so the pool can score it")
+        XCTAssertEqual(server.connectCount, 0, "no socket was opened to the relay at all")
+        XCTAssertTrue(sink.ups.isEmpty, "and no link was surfaced")
     }
 
     // MARK: 429 rate-limit: the upgrade is rejected, didCompleteWithError carries the 429, backoff honors it.
