@@ -39,9 +39,13 @@ Add the package with Swift Package Manager:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/hopmesh/hop-bearers-apple.git", branch: "main"),
+    .package(url: "https://github.com/hopmesh/hop-bearers-apple.git", from: "0.0.2"),
 ]
 ```
+
+Pin a released version, not `branch: "main"`. SwiftPM's distribution channel IS the version tag: the
+mirror is tagged `vX.Y.Z` on every release, and tracking the branch instead silently opts out of that
+and rebuilds against whatever landed last.
 
 Then depend on the transports a target needs (each is its own product):
 
