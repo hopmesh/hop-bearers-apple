@@ -20,18 +20,19 @@
 Hop is a **delay-tolerant, end-to-end-encrypted mesh**: messages hop device to device over BLE, Wi-Fi,
 and the internet until they reach the person or service you meant. Held, never dropped.
 
-**Hop Bearers for Apple is the transport layer.** Three independent SwiftPM libraries (BLE, LAN, cloud
-relay) each discover peers, form links, and shuttle application bytes, and each implements the same
-tiny `Bearer` / `LinkSink` contract. The bearer owns the radio and its own dedup; the core never sees a
-socket, and you pull in only the pipes you need.
+**Hop Bearers for Apple is the transport layer.** Independent SwiftPM libraries (BLE, LAN, cloud relay,
+Meshtastic/LoRa) each discover peers, form links, and shuttle application bytes, and each implements the
+same tiny `Bearer` / `LinkSink` contract. The bearer owns the radio and its own dedup; the core never
+sees a socket, and you pull in only the pipes you need.
 
 ## What's in the box
 
 | Product          | Transport   | How it works                                                        |
 | ---------------- | ----------- | ------------------------------------------------------------------- |
-| `HopBearerBle`   | BLE         | GATT carries the PSM handshake, L2CAP carries data, iBeacon wakes a killed app |
-| `HopBearerLan`   | Wi-Fi / LAN | mDNS `_hoplan._tcp` discovery over TCP                              |
-| `HopBearerRelay` | Internet    | one outbound WebSocket to a relay (`URLSession`, no inbound port)   |
+| `HopBearerBle`        | BLE         | GATT carries the PSM handshake, L2CAP carries data, iBeacon wakes a killed app |
+| `HopBearerLan`        | Wi-Fi / LAN | mDNS `_hoplan._tcp` discovery over TCP                              |
+| `HopBearerRelay`      | Internet    | one outbound WebSocket to a relay (`URLSession`, no inbound port)   |
+| `HopBearerMeshtastic` | LoRa mesh   | relays through a connected Meshtastic radio: fragments frames into mesh packets on a private app port |
 
 ## Install
 
@@ -51,9 +52,10 @@ Then depend on the transports a target needs (each is its own product):
 
 ```swift
 .target(name: "MyApp", dependencies: [
-    .product(name: "HopBearerBle",   package: "hop-bearers-apple"),
-    .product(name: "HopBearerLan",   package: "hop-bearers-apple"),
-    .product(name: "HopBearerRelay", package: "hop-bearers-apple"),
+    .product(name: "HopBearerBle",        package: "hop-bearers-apple"),
+    .product(name: "HopBearerLan",        package: "hop-bearers-apple"),
+    .product(name: "HopBearerRelay",      package: "hop-bearers-apple"),
+    .product(name: "HopBearerMeshtastic", package: "hop-bearers-apple"),
 ])
 ```
 
@@ -70,6 +72,7 @@ import HopContract      // the Bearer / LinkSink contract, shipped with the Hop 
 import HopBearerBle
 import HopBearerLan
 import HopBearerRelay
+import HopBearerMeshtastic
 
 let myId = BleBearer.randomNodeId()          // 16 random bytes, stable for the process
 
@@ -77,6 +80,7 @@ let mesh = BearerManager()
 mesh.register(BleBearer(myId: myId))         // GATT PSM handshake, L2CAP data, iBeacon wake
 mesh.register(LanBearer(myId: myId))         // mDNS _hoplan._tcp + TCP
 mesh.register(RelayBearer(relayURL: "wss://relay.hopme.sh/"))
+mesh.register(MeshtasticBearer(myId: myId))  // relay through a connected Meshtastic LoRa radio
 
 mesh.sink = myConsumer                        // gets linkUp / linkBytes / linkDown
 mesh.start()
