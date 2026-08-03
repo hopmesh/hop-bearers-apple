@@ -5,6 +5,7 @@ git-cliff. Do not edit by hand.
 ## Unreleased
 
 ### Bug Fixes
+- make the published bearer and driver packages actually resolvable (b3eaec2)
 - per-mirror repository, and retryable release artifacts (bf04449)
 - make the PLAT-001 tests actually run, and correct what the last commit claimed (15065c8)
 - disabling a transport now actually stops it (PLAT-001) (7b84c71)
@@ -20,6 +21,7 @@ git-cliff. Do not edit by hand.
 - finish the monorepo layout, kill platform stubs, unify the platform axis (O-1/O-3/O-4/O-5) (#115) (b56bb49)
 
 ### Documentation
+- regenerate from conventional commits (7a81fb6)
 - regenerate from conventional commits (e6b97f2)
 - regenerate from conventional commits (2741000)
 - regenerate from conventional commits (b96e019)
@@ -31,11 +33,15 @@ git-cliff. Do not edit by hand.
 - branded, marketable READMEs for every sub-repo (9c2a477)
 
 ### Features
+- add Meshtastic/LoRa bearer for iOS and Android (9335a6e)
 - finish inbound (import), drop export_pr (41c095e)
 - auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 
 ### Other
+- add the release workflow that makes the bearers publish (99d4317)
 - stop the L2CAP open-error spin against an already-connected peer (79b9f22)
+- let a host set the relay SOCKS proxy from driver config (51be0c1)
+- prove .onion relays flow through the pool, and add an Apple SOCKS hook (8a0d9f3)
 - extract Multipeer so EVERY bearer registers with the manager (f3949f7)
 - cut the frame cap to the protocol's, and pin it (2a16945)
 - Apple was resetting the dial backoff at the wrong moment (f94599f)
