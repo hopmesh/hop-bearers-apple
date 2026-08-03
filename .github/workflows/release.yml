@@ -19,16 +19,35 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Describe every package manifest
+      - name: Validate the package a consumer actually gets
         run: |
           set -euo pipefail
-          found=0
-          for manifest in */Package.swift; do
-            [ -f "$manifest" ] || continue
-            found=1
-            swift package describe --package-path "$(dirname "$manifest")"
-          done
-          test "$found" -eq 1
+          # THE ROOT MANIFEST IS THE PRODUCT. SwiftPM only resolves a dependency whose manifest is at the
+          # repository ROOT, so this is the single file that decides whether the tag is usable. This step
+          # used to describe `*/Package.swift`, i.e. only the per-bearer manifests in subdirectories,
+          # which SwiftPM never reads from a consumer's point of view. With no root manifest at all, the
+          # releases still went green while every consumer got "the package manifest at '/Package.swift'
+          # cannot be accessed". Describe the root, and prove the products are really there.
+          test -f Package.swift || { echo "no root Package.swift: this tag would be unusable"; exit 1; }
+          swift package describe --type json > "$RUNNER_TEMP/described.json"
+          python3 - "$RUNNER_TEMP/described.json" <<'PY'
+          import json
+          import sys
+
+          described = json.load(open(sys.argv[1]))
+          published = {product["name"] for product in described.get("products", [])}
+          expected = {
+              "HopBearerBle",
+              "HopBearerLan",
+              "HopBearerMultipeer",
+              "HopBearerRelay",
+              "HopBearerMeshtastic",
+          }
+          missing = sorted(expected - published)
+          if missing:
+              raise SystemExit(f"root manifest does not expose: {', '.join(missing)}")
+          print(f"root package exposes {len(published)} products: {', '.join(sorted(published))}")
+          PY
           mkdir "$RUNNER_TEMP/release"
           python3 .github/release-artifact.py create --directory "$RUNNER_TEMP/release"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
