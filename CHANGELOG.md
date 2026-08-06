@@ -21,6 +21,7 @@ git-cliff. Do not edit by hand.
 - finish the monorepo layout, kill platform stubs, unify the platform axis (O-1/O-3/O-4/O-5) (#115) (b56bb49)
 
 ### Documentation
+- regenerate from conventional commits (3b47a5f)
 - regenerate from conventional commits (ffb2acb)
 - regenerate from conventional commits (e19ed95)
 - regenerate from conventional commits (7a81fb6)
@@ -44,6 +45,7 @@ git-cliff. Do not edit by hand.
 - stop the L2CAP open-error spin against an already-connected peer (79b9f22)
 - let a host set the relay SOCKS proxy from driver config (51be0c1)
 - prove .onion relays flow through the pool, and add an Apple SOCKS hook (8a0d9f3)
+- drive relay failover through the real §19 node pool (PLAT-003) (bed478d)
 - extract Multipeer so EVERY bearer registers with the manager (f3949f7)
 - cut the frame cap to the protocol's, and pin it (2a16945)
 - Apple was resetting the dial backoff at the wrong moment (f94599f)
