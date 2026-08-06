@@ -9,6 +9,7 @@ import XCTest
 import Foundation
 import Network
 import CryptoKit
+import Hop            // the published SDK's HopNode, for the §19-pool failover case (PLAT-003)
 import HopContract
 @testable import HopBearerRelay
 
@@ -369,6 +370,77 @@ final class RelayIntegrationTests: XCTestCase {
             RelayBearer.stablePeerId(forURL: deadURL),
             "the peer id stays seeded, so failover does not churn manager bookkeeping"
         )
+    }
+
+    // MARK: the same failover, driven by the REAL §19 node pool through the published SDK (PLAT-003).
+
+    func testPooledBearerFailsOverThroughTheNodePoolWithoutRestarting() throws {
+        // The case above proves the BEARER asks per attempt; it hand-rolls the resolver, so it says
+        // nothing about whether a host can build one. PLAT-003 was that nobody could: sdk/hop.h sold
+        // the v4 -> v5 ABI bump as buying failover while no C-ABI wrapper bound hop_relay_add /
+        // hop_relay_next / hop_relay_report / hop_relay_pool_size, so an SDK-only integrator's only
+        // reachable constructor was the fixed-URL one and a dead relay ended internet reach until the
+        // app restarted. Here the closures come straight off HopNode, and nothing else drives the
+        // choice of endpoint: the pool does.
+        guard let node = HopNode.ephemeral() else { return XCTFail("ephemeral nil") }
+        node.tick(nowMs: 1_700_000_000_000)
+
+        // The dead endpoint REFUSES connections rather than answering 429. A 429 with no Retry-After
+        // is honored as the 30 s ceiling, which is longer than any sane test window, so the failover
+        // dial would never be observed; a refused connection uses the ordinary 1 s exponential floor.
+        let dead = WSTestServer(); dead.start()
+        let deadURL = dead.url
+        dead.stop()
+        let live = WSTestServer(); live.start()
+        defer { live.stop() }
+        XCTAssertGreaterThan(live.port, 0)
+        let liveURL = live.url
+
+        // Only the dead endpoint is configured, so the first dial is forced onto it.
+        XCTAssertTrue(node.relayAdd(deadURL))
+        XCTAssertEqual(node.relayNext(), deadURL, "the one configured endpoint is what gets dialed")
+
+        // The pool decides where to dial; this mirror exists only so the test can SYNCHRONIZE on the
+        // failure having reached the pool. Adding the second endpoint before that point would let the
+        // first dial pick it and the test would prove nothing.
+        let lock = NSLock()
+        var reports: [(String, Bool)] = []
+        let bearer = RelayBearer(
+            seedURL: deadURL,
+            resolveURL: { node.relayNext() },
+            reportOutcome: { url, ok in
+                lock.withLock { reports.append((url, ok)) }
+                node.relayReport(url, ok: ok)
+            }
+        )
+        let sink = RecSink(); bearer.sink = sink
+        bearer.start()
+        defer { bearer.stop() }
+
+        // The dial fails against the dead endpoint and the outcome lands in the POOL.
+        XCTAssertTrue(
+            spinWait(8) { lock.withLock { reports.contains { $0.0 == deadURL && !$0.1 } } },
+            "the failed dial must be reported to the pool against the endpoint that failed"
+        )
+
+        // A second endpoint appears (gossip supplies it). It is added UNCONFIGURED on purpose: the
+        // pool ranks a configured endpoint above a gossiped one at equal health, so the only thing
+        // that can move the dial off the dead one is the failure just reported. Add it configured and
+        // this assertion would pass on a tie-break even with reporting broken, which is no proof.
+        XCTAssertTrue(node.relayAdd(liveURL, configured: false))
+        XCTAssertEqual(node.relayNext(), liveURL, "a just-failed endpoint must yield to a healthy one")
+
+        // And the running bearer must actually get there, with no restart and no re-register: it asks
+        // the pool again on its next backoff tick and opens a real socket to the healthy endpoint.
+        guard spinWait(20, until: { !sink.ups.isEmpty }) else {
+            throw XCTSkip("URLSession did not open a cleartext ws:// loopback socket (ATS?)")
+        }
+        XCTAssertTrue(
+            spinWait(8) { lock.withLock { reports.contains { $0.0 == liveURL && $0.1 } } },
+            "the successful dial is reported against the endpoint that earned it"
+        )
+        XCTAssertEqual(node.relayNext(), liveURL, "the working endpoint is kept after a success")
+        XCTAssertEqual(node.relayPool().total, 2)
     }
 
     func testPooledBearerWithNothingDialableWaitsInsteadOfStopping() {

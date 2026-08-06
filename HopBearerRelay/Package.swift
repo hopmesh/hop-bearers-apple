@@ -17,6 +17,15 @@ let package = Package(
         // Pure-logic coverage: the stable peerId derivation, the exponential-backoff step, the 429
         // Retry-After parse, and the jittered reconnect delay. None need a live WebSocket, so they run in
         // a headless macOS CI job.
-        .testTarget(name: "HopBearerRelayTests", dependencies: ["HopBearerRelay"]),
+        //
+        // The TEST target additionally links `Hop` (the libhop node) so one case can drive failover
+        // through the REAL §19 pool rather than a hand-rolled resolver: PLAT-003 was that no SDK
+        // exposed the pool at all, so "an SDK-only host survives its relay going dark" was unprovable.
+        // The library target still depends on HopContract alone, so a consumer driving the node via
+        // UniFFI does not double-link the Rust core.
+        .testTarget(
+            name: "HopBearerRelayTests",
+            dependencies: ["HopBearerRelay", .product(name: "Hop", package: "apple")]
+        ),
     ]
 )
